@@ -297,6 +297,57 @@
         </div>
       </div>
 
+      <!-- ── WiFi Brute-Force ─────────────────────────────────── -->
+      <div class="atk-card">
+        <div class="atk-card-title">
+          &#x1F511; WiFi Brute-Force
+          <span class="badge" id="brute-badge">IDLE</span>
+        </div>
+
+        <p style="font-size:.78rem;color:var(--text-dim);margin-bottom:12px">
+          Tries each password in the wordlist against the selected SSID via the STA
+          interface. WPA/WPA2-PSK only. Speed ≈ 1 password every 3–4 s.
+        </p>
+
+        <div class="form-group">
+          <label>Target SSID</label>
+          <input type="text" id="brute-ssid" placeholder="Auto-filled on target select"
+                 maxlength="32" autocomplete="off">
+          <div class="hint">Defaults to selected target SSID</div>
+        </div>
+
+        <div class="form-group">
+          <label>Wordlist</label>
+          <select id="brute-wordlist">
+            <option value="/wordlist.txt">Default (built-in)</option>
+            <option value="/wordlist_custom.txt">Custom (uploaded)</option>
+          </select>
+          <div class="hint">
+            <input type="file" id="brute-upload" accept=".txt" style="display:none"
+                   onchange="uploadWordlist(this.files[0])">
+            <a href="#" onclick="document.getElementById('brute-upload').click();return false;"
+               style="color:var(--accent);text-decoration:underline">Upload custom wordlist (.txt)</a>
+            — one password per line, max 256&nbsp;KB
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Timeout per password (ms)</label>
+          <input type="number" id="brute-timeout" value="4000" min="1500" max="15000" step="500">
+        </div>
+
+        <div class="btn-group" style="margin-bottom:10px">
+          <button class="btn btn-danger" id="btn-brute-start" onclick="bruteStart()">&#x25B6; Start</button>
+          <button class="btn btn-ghost"  id="btn-brute-stop"  onclick="bruteStop()" disabled>&#x25A0; Stop</button>
+        </div>
+
+        <div id="brute-progress" style="font-size:.78rem;color:var(--text-dim)">
+          <div>Progress: <span id="brute-prog">0 / 0</span></div>
+          <div>Current:  <code id="brute-cur">—</code></div>
+          <div id="brute-result" style="margin-top:6px"></div>
+        </div>
+      </div>
+
     </div><!-- /advanced attack-grid -->
   </div><!-- /attack-section -->
 
@@ -732,12 +783,117 @@ function renderEapol() {
   });
 }
 
-/* Auto-fill Evil Twin SSID when target is selected */
+/* Auto-fill Evil Twin + Brute SSIDs when target is selected */
 var _origSelectNetwork = selectNetwork;
 selectNetwork = function(n, rowEl) {
   _origSelectNetwork(n, rowEl);
-  document.getElementById('et-ssid').value = n.ssid || '';
+  document.getElementById('et-ssid').value    = n.ssid || '';
+  document.getElementById('brute-ssid').value = n.ssid || '';
 };
+
+/* ── WiFi Brute-Force ─────────────────────────────────────── */
+var bruteOn = false;
+
+async function bruteStart() {
+  var ssid    = document.getElementById('brute-ssid').value.trim();
+  var wl      = document.getElementById('brute-wordlist').value;
+  var timeout = parseInt(document.getElementById('brute-timeout').value, 10) || 4000;
+  if (!ssid) { toast('Pick a target or type an SSID', 'error'); return; }
+
+  var r = await api('/api/attack/brute/start', 'POST',
+                    { ssid: ssid, wordlist: wl, timeout: timeout });
+  if (r.ok) {
+    bruteOn = true;
+    setBadge('brute-badge', true);
+    document.getElementById('btn-brute-start').disabled = true;
+    document.getElementById('btn-brute-stop').disabled  = false;
+    document.getElementById('brute-result').textContent = '';
+    toast('Brute-force started → ' + ssid, 'warn');
+    pollBrute();
+  } else {
+    toast((r.data && r.data.error) || 'Failed to start brute-force', 'error');
+  }
+}
+
+async function bruteStop() {
+  var r = await api('/api/attack/brute/stop', 'POST');
+  if (r.ok) {
+    bruteOn = false;
+    setBadge('brute-badge', false);
+    document.getElementById('btn-brute-start').disabled = false;
+    document.getElementById('btn-brute-stop').disabled  = true;
+    toast('Brute-force stopped', 'success');
+  }
+}
+
+function setBruteFound(pwd) {
+  var box = document.getElementById('brute-result');
+  box.textContent = '';
+  var label = document.createElement('strong');
+  label.style.color = 'var(--success)';
+  label.textContent = '✔ FOUND: ';
+  var code = document.createElement('code');
+  code.style.cssText = 'background:#222;padding:2px 6px;border-radius:3px';
+  code.textContent = pwd;
+  box.appendChild(label);
+  box.appendChild(code);
+}
+
+function setBruteNoMatch() {
+  var box = document.getElementById('brute-result');
+  box.textContent = '';
+  var span = document.createElement('span');
+  span.style.color = 'var(--text-dim)';
+  span.textContent = 'No password matched.';
+  box.appendChild(span);
+}
+
+async function pollBrute() {
+  var r = await api('/api/attack/brute/status');
+  if (r.ok && r.data) {
+    var d = r.data;
+    document.getElementById('brute-prog').textContent =
+        (d.tried || 0) + ' / ' + (d.total || 0);
+    document.getElementById('brute-cur').textContent  = d.current || '—';
+
+    if (d.found) {
+      setBruteFound(d.password);
+      bruteOn = false;
+      setBadge('brute-badge', false);
+      document.getElementById('btn-brute-start').disabled = false;
+      document.getElementById('btn-brute-stop').disabled  = true;
+      toast('Password found: ' + d.password, 'success');
+      return;
+    }
+    if (!d.active && bruteOn) {
+      bruteOn = false;
+      setBadge('brute-badge', false);
+      document.getElementById('btn-brute-start').disabled = false;
+      document.getElementById('btn-brute-stop').disabled  = true;
+      setBruteNoMatch();
+      return;
+    }
+  }
+  if (bruteOn) setTimeout(pollBrute, 1500);
+}
+
+async function uploadWordlist(file) {
+  if (!file) return;
+  if (file.size > 256 * 1024) { toast('File > 256KB — too large', 'error'); return; }
+  var fd = new FormData();
+  fd.append('file', file);
+  try {
+    var resp = await fetch('/api/attack/brute/wordlist', {
+      method: 'POST', body: fd, credentials: 'same-origin'
+    });
+    if (resp.ok) {
+      toast('Wordlist uploaded — choose "Custom" to use it', 'success');
+      document.getElementById('brute-wordlist').value = '/wordlist_custom.txt';
+    } else {
+      toast('Upload failed (HTTP ' + resp.status + ')', 'error');
+    }
+  } catch (e) { toast('Upload error: ' + e.message, 'error'); }
+}
 </script>
 </body>
 </html>

