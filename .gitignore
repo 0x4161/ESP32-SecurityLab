@@ -1,0 +1,16 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.idea/
+.DS_Store
+*.pyc
+__pycache__/
+.claude/
+.clangd/
+.cache/
+build/
+dist/
+node_modules/
+*.swp
+*.swo

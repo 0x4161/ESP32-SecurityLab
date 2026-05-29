@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BLE | ESP32 Security Lab</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-brand">ESP32 <span>// SecurityLab</span></div>
+  <a href="index.html">Home</a>
+  <a href="wifi.html">Wi-Fi Recon</a>
+  <a href="attack.html">Attack</a>
+  <a href="ble.html" class="active">BLE</a>
+  <a href="advanced.html">Advanced</a>
+  <a href="lab.html">Lab Sim</a>
+  <a href="logs.html">Logs</a>
+  <a href="settings.html">Settings</a>
+</nav>
+
+<div class="container">
+
+  <div class="page-header">
+    <h1><span class="accent">&gt;</span> BLE Panel</h1>
+    <p>Bluetooth Low Energy Scanner &amp; Advertisement Spam — Educational Use Only</p>
+  </div>
+
+  <div class="grid-2" style="align-items:start">
+
+    <!-- ── BLE Scanner ────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-title" style="display:flex;justify-content:space-between">
+        <span>&#x1F4F6; BLE Scanner</span>
+        <span class="badge badge-blue" id="scan-badge">IDLE</span>
+      </div>
+
+      <div class="form-group">
+        <label>Scan Duration (seconds)</label>
+        <input type="number" id="ble-scan-dur" value="5" min="1" max="30">
+      </div>
+
+      <div class="btn-group">
+        <button class="btn btn-primary" id="btn-scan" onclick="bleStartScan()">&#x25B6; Scan</button>
+        <button class="btn btn-ghost"   onclick="clearDevices()">&#x2717; Clear</button>
+        <button class="btn btn-ghost"   onclick="exportDevicesCSV()">&#x2193; CSV</button>
+      </div>
+
+      <div style="margin-top:12px">
+        <div style="display:flex;justify-content:space-between;font-size:.78rem;margin-bottom:6px">
+          <span class="text-dim">Devices found</span>
+          <span id="ble-count" class="text-b">0</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Name</th><th>MAC</th><th>RSSI</th><th>RSSI Bar</th></tr>
+            </thead>
+            <tbody id="ble-table">
+              <tr><td colspan="4" style="text-align:center;color:var(--text-dim);padding:20px">
+                Press Scan to enumerate BLE devices
+              </td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── BLE Spam ───────────────────────────────────────────── -->
+    <div class="card">
+      <div class="card-title" style="display:flex;justify-content:space-between">
+        <span>&#x1F4A5; BLE Spam</span>
+        <span class="badge badge-blue" id="spam-badge">IDLE</span>
+      </div>
+
+      <p style="font-size:.8rem;color:var(--text-dim);margin-bottom:14px">
+        Floods the RF spectrum with BLE advertisement frames mimicking Apple Continuity,
+        Android Fast Pair, and Windows Nearby Sharing notifications.
+      </p>
+
+      <div class="form-group">
+        <label>Target Platform</label>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="spam-apple"   checked> Apple
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="spam-android" checked> Android
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="spam-windows" checked> Windows
+          </label>
+        </div>
+        <div class="hint">Each selected platform sends its own advertisement payload.</div>
+      </div>
+
+      <div class="btn-group">
+        <button class="btn btn-danger" id="btn-spam-start" onclick="bleSpamStart()">&#x25B6; Start Spam</button>
+        <button class="btn btn-ghost"  id="btn-spam-stop"  onclick="bleSpamStop()" disabled>&#x25A0; Stop</button>
+      </div>
+
+      <div style="margin-top:14px;border-top:1px solid var(--border);padding-top:12px">
+        <div class="card-title" style="margin-bottom:8px;font-size:.82rem">Payload Details</div>
+        <div class="info-row" style="font-size:.78rem">
+          <span class="text-dim">Apple</span>
+          <span class="text-g" style="font-size:.72rem;font-family:monospace">1E FF 4C 00 10 05 01 ...</span>
+        </div>
+        <div class="info-row" style="font-size:.78rem">
+          <span class="text-dim">Android</span>
+          <span class="text-b" style="font-size:.72rem;font-family:monospace">03 03 2C FE 06 16 2C FE ...</span>
+        </div>
+        <div class="info-row" style="font-size:.78rem">
+          <span class="text-dim">Windows</span>
+          <span style="font-size:.72rem;font-family:monospace;color:var(--warn)">02 01 06 0D FF 06 00 09 ...</span>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Signal strength legend ─────────────────────────────── -->
+  <div class="card mb0">
+    <div class="card-title">RSSI Signal Guide</div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:.8rem">
+      <div><span class="dot dot-g"></span> &gt; -60 dBm — Excellent (same room)</div>
+      <div><span class="dot" style="background:var(--blue)"></span> -60 to -75 dBm — Good (nearby)</div>
+      <div><span class="dot" style="background:var(--warn)"></span> -75 to -90 dBm — Fair (farther)</div>
+      <div><span class="dot dot-r"></span> &lt; -90 dBm — Weak (edge of range)</div>
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<script src="app.js"></script>
+<script>
+/* ── State ───────────────────────────────────────────────── */
+var bleDevices = [];
+
+/* ── RSSI bar (safe DOM) ─────────────────────────────────── */
+function rssiBar(rssi) {
+  var pct   = Math.min(100, Math.max(0, (rssi + 100) * 2));
+  var color = rssi > -60 ? 'var(--green)' : rssi > -75 ? 'var(--blue)'
+                         : rssi > -90 ? 'var(--warn)' : 'var(--danger)';
+  var wrap = document.createElement('div');
+  wrap.className = 'progress';
+  wrap.style.height = '6px';
+  var bar = document.createElement('div');
+  bar.className = 'progress-bar';
+  bar.style.width      = pct + '%';
+  bar.style.background = color;
+  wrap.appendChild(bar);
+  return wrap;
+}
+
+/* ══ BLE SCANNER ═════════════════════════════════════════════ */
+var blePollTimer = null;
+
+async function bleStartScan() {
+  var dur = parseInt(document.getElementById('ble-scan-dur').value) || 5;
+  var btn = document.getElementById('btn-scan');
+  var bdg = document.getElementById('scan-badge');
+
+  btn.disabled    = true;
+  btn.textContent = 'Scanning...';
+  bdg.textContent = 'SCANNING';
+  bdg.className   = 'badge badge-warn';
+
+  var r = await api('/api/ble/scan', 'POST', { duration: dur });
+  if (!r.ok) {
+    btn.disabled    = false;
+    btn.textContent = '▶ Scan';
+    bdg.textContent = 'ERROR';
+    bdg.className   = 'badge badge-red';
+    toast((r.data && r.data.msg) || 'BLE scan failed', 'error');
+    return;
+  }
+
+  toast('BLE scanning for ' + dur + ' s...', 'success');
+  /* Poll /api/ble/results until scanning=false */
+  clearInterval(blePollTimer);
+  blePollTimer = setInterval(async function () {
+    var res = await api('/api/ble/results');
+    if (!res.ok) return;
+    if (!res.data.scanning) {
+      clearInterval(blePollTimer);
+      blePollTimer = null;
+      bleDevices      = res.data.devices || [];
+      bdg.textContent = 'DONE';
+      bdg.className   = 'badge badge-blue';
+      btn.disabled    = false;
+      btn.textContent = '▶ Scan';
+      renderDevices();
+      toast('Found ' + bleDevices.length + ' BLE device' + (bleDevices.length !== 1 ? 's' : ''), 'success');
+    }
+  }, 1500);
+}
+
+function clearDevices() {
+  bleDevices = [];
+  renderDevices();
+  document.getElementById('scan-badge').textContent = 'IDLE';
+  document.getElementById('scan-badge').className   = 'badge badge-blue';
+  toast('Cleared', 'success');
+}
+
+function renderDevices() {
+  var tbody = document.getElementById('ble-table');
+  tbody.textContent = '';
+  document.getElementById('ble-count').textContent = bleDevices.length;
+
+  if (!bleDevices.length) {
+    var tr = document.createElement('tr');
+    var td = document.createElement('td');
+    td.colSpan = 4;
+    td.textContent = 'No devices found';
+    td.style.cssText = 'text-align:center;color:var(--text-dim);padding:20px';
+    tr.appendChild(td); tbody.appendChild(tr);
+    return;
+  }
+
+  /* Sort by RSSI descending (strongest first) */
+  var sorted = bleDevices.slice().sort(function (a, b) { return b.rssi - a.rssi; });
+
+  sorted.forEach(function (dev) {
+    var tr = document.createElement('tr');
+
+    var tdName = document.createElement('td');
+    tdName.textContent = dev.name || '(unknown)';
+    if (!dev.name) tdName.style.color = 'var(--text-dim)';
+
+    var tdMac = document.createElement('td');
+    tdMac.textContent   = dev.mac;
+    tdMac.style.fontFamily = 'monospace';
+    tdMac.style.fontSize   = '.78rem';
+
+    var tdRssi = document.createElement('td');
+    var rssiColor = dev.rssi > -60 ? 'var(--green)'
+                  : dev.rssi > -75 ? 'var(--blue)'
+                  : dev.rssi > -90 ? 'var(--warn)' : 'var(--danger)';
+    tdRssi.textContent = dev.rssi + ' dBm';
+    tdRssi.style.color = rssiColor;
+
+    var tdBar = document.createElement('td');
+    tdBar.style.minWidth = '80px';
+    tdBar.appendChild(rssiBar(dev.rssi));
+
+    tr.append(tdName, tdMac, tdRssi, tdBar);
+    tbody.appendChild(tr);
+  });
+}
+
+function exportDevicesCSV() {
+  if (!bleDevices.length) { toast('No devices to export', 'warn'); return; }
+  var lines = ['Name,MAC,RSSI'];
+  bleDevices.forEach(function (d) {
+    var name = '"' + String(d.name || '').replace(/"/g, '""') + '"';
+    var mac  = '"' + String(d.mac  || '').replace(/"/g, '""') + '"';
+    lines.push(name + ',' + mac + ',' + d.rssi);
+  });
+  var blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  var url  = URL.createObjectURL(blob);
+  var a    = document.createElement('a');
+  a.href = url; a.download = 'ble_devices.csv'; a.click();
+  URL.revokeObjectURL(url);
+  toast('Exported ' + bleDevices.length + ' devices', 'success');
+}
+
+/* ══ BLE SPAM ════════════════════════════════════════════════ */
+async function bleSpamStart() {
+  var apple   = document.getElementById('spam-apple').checked;
+  var android = document.getElementById('spam-android').checked;
+  var windows = document.getElementById('spam-windows').checked;
+
+  if (!apple && !android && !windows) {
+    toast('Select at least one platform', 'warn'); return;
+  }
+
+  var r = await api('/api/ble/spam', 'POST',
+                     { apple: apple, android: android, windows: windows });
+  if (r.ok) {
+    document.getElementById('spam-badge').textContent = 'RUNNING';
+    document.getElementById('spam-badge').className   = 'badge badge-red';
+    document.getElementById('btn-spam-start').disabled = true;
+    document.getElementById('btn-spam-stop').disabled  = false;
+    toast('BLE spam running', 'warn');
+  } else {
+    toast((r.data && r.data.msg) || 'Failed to start spam', 'error');
+  }
+}
+
+async function bleSpamStop() {
+  var r = await api('/api/ble/spam/stop', 'POST');
+  if (r.ok) {
+    document.getElementById('spam-badge').textContent = 'IDLE';
+    document.getElementById('spam-badge').className   = 'badge badge-blue';
+    document.getElementById('btn-spam-start').disabled = false;
+    document.getElementById('btn-spam-stop').disabled  = true;
+    toast('BLE spam stopped', 'success');
+  }
+}
+</script>
+</body>
+</html>
