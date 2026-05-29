@@ -1,93 +1,95 @@
-# ESP32 Security Lab
+# REAPER — Wireless Offensive Toolkit
 
-Offensive Wi-Fi & BLE security toolkit running on an ESP32-WROOM-32 with a 0.96" SSD1306 OLED. Includes a web dashboard, an OLED menu controlled by a single button, and a set of 802.11 attack primitives written directly against ESP-IDF.
+A pocket-sized wireless attack platform running on an ESP32-WROOM-32 with a 0.96" OLED. Every operation is controlled from the device itself (single BOOT button + on-screen menu). The web surface is a public landing page only — no remote control endpoints.
 
-> **For authorized security research and education only.** Do not use on networks or devices you do not own or have explicit permission to test.
+> **For authorized security research, hardware education, and CTF/lab use only.** Using this against any network or device you do not own or have written permission to test is illegal and not endorsed by the author.
 
-## Features
+## Arsenal
 
-### Wi-Fi
-- **Scan** — full 2.4 GHz band enumeration with SSID / BSSID / RSSI / channel / encryption
-- **Deauthentication / Disassociation** — raw 802.11 frame injection (`0xC0` / `0xA0`) on the target's channel
-- **Multi-target deauth** — rotates through every AP selected on the OLED list
-- **Beacon flood** — broadcasts up to 1000+ fake SSIDs per second (sequentially numbered)
-- **Probe-request sniffer** — captures probes from nearby clients (MAC + searched SSID + RSSI)
-- **EAPOL sniffer** — captures the WPA 4-way handshake (`0x888E`) for offline cracking
+### Wi-Fi (2.4 GHz)
+- **Scan** — full band enumeration: SSID / BSSID / RSSI / channel / encryption
+- **Deauth / Disassoc** — raw 802.11 frame injection (`0xC0` / `0xA0`) on the target's channel
+- **Multi-target deauth** — rotates through every AP marked on the scan list
+- **PSK Brute-Force** — iterates a 5,000-password built-in wordlist (`/wordlist.txt`) via `WiFi.begin()`; ~3–4 s per password
+- **Beacon Flood** — broadcasts thousands of sequentially numbered phantom SSIDs (`#VOID TEST 1 .. N`)
+- **Probe Sniffer** — captures probe requests (MAC + remembered SSID + RSSI)
+- **EAPOL Sniffer** — captures WPA 4-way handshake frames (EtherType `0x888E`) for offline cracking
 - **Evil Twin** — clones a target SSID as an open AP on the same channel
 
 ### Bluetooth LE
 - **Scan** — BLE advertising scanner with name / RSSI / address
-- **BLE Spam** — Apple proximity / Microsoft Swift Pair / Samsung Easy Setup payloads, cycled
+- **BLE Spam** — Apple Continuity / Microsoft Swift Pair / Samsung Easy Setup payloads, cycled
 
-### UI
-- **Web dashboard** at `192.168.4.1` — session-cookie authenticated (httpOnly, SameSite=Strict)
-- **OLED menu** — single BOOT-button (GPIO0) navigation, short / long press
-- **Serial logs** at 115200 baud
+## Control surface
+
+The entire device is driven by a single button (BOOT, GPIO0) and the OLED.
+
+| Action | Meaning |
+|--------|---------|
+| Short press | Move cursor / cycle selector |
+| Long press  | Enter screen / start operation / commit |
+
+Web surface is `http://192.168.4.1/` — a static landing page describing the project and linking to author socials. There are **no operational HTTP endpoints**.
 
 ## Hardware
 
-- **ESP32-WROOM-32** (any dev board)
-- **SSD1306 0.96" I²C OLED** — auto-detected on common pin combinations (SDA=21 SCL=22 default)
-- **BOOT button (GPIO0)** for menu navigation
+- ESP32-WROOM-32 dev board
+- SSD1306 0.96″ I²C OLED (auto-detected on SDA=21 SCL=22 or alt pins)
+- BOOT button on GPIO0 (already on most dev boards)
 - USB-to-serial cable for flashing
 
 ## Build & Flash
 
-Requires [PlatformIO](https://platformio.org/) (CLI or VSCode).
+Requires [PlatformIO](https://platformio.org/).
 
 ```bash
-# Build firmware
-pio run
-
-# Flash firmware to board
+# 1. Firmware
 pio run -t upload
 
-# Upload web dashboard files (LittleFS)
+# 2. Filesystem (landing page + wordlist)
 pio run -t uploadfs
 
-# Serial monitor
+# 3. Serial monitor (115200 baud)
 pio device monitor
 ```
 
-Default Wi-Fi AP credentials:
-- **SSID:** `ESP32-SecurityLab`
-- **Pass:** `lab12345`
-- **Dashboard:** http://192.168.4.1
+Defaults:
+- AP SSID: `ESP32-SecurityLab`
+- AP pass: `lab12345`
+- Landing page: http://192.168.4.1/
 
-## Project Structure
+## Layout
 
 ```
 .
-├── platformio.ini          PlatformIO build config
-├── src/
-│   └── main.cpp            Firmware (Wi-Fi, BLE, OLED, web server, attacks)
-└── data/                   LittleFS web dashboard
-    ├── index.html
-    ├── attack.html
-    ├── wifi.html
-    ├── ble.html
-    ├── lab.html
-    ├── logs.html
-    ├── settings.html
-    ├── advanced.html
-    ├── app.js
-    └── style.css
+├── platformio.ini
+├── src/main.cpp              # firmware
+└── data/                     # LittleFS
+    ├── index.html            # landing page (project + socials)
+    ├── style.css
+    └── wordlist.txt          # 5000 passwords, brute-force input
 ```
 
-## Architecture Notes
+## Implementation notes
 
-- **Cores:** Wi-Fi attacks, BLE scan, BLE spam → Core 0. AsyncTCP web server → Core 1.
-- **BLE / Wi-Fi radio coexistence:** Wi-Fi scan path fully deinits Bluedroid + BT controller before starting the scan, then re-inits both. The shared 2.4 GHz radio cannot run a `WiFi.scanNetworks()` while BLE is active.
-- **Raw frame injection bypass:** Overrides `ieee80211_raw_frame_sanity_check()` so ESP-IDF's WiFi driver accepts injected management frames (Deauth `0xC0`, Disassoc `0xA0`) instead of dropping them with "unsupport frame type".
-- **AP off during deauth:** During an active deauth attack the radio is moved to STA-only mode (`esp_wifi_set_mode(WIFI_MODE_STA)`) so the AP beacon scheduler does not pull the radio back to the dashboard's channel.
-- **Country code = "JP":** Set at boot with `WIFI_COUNTRY_POLICY_MANUAL` so channels 12–14 are TX-enabled. Default ("01" worldwide indoor) silently restricts TX to ch 1–11.
-- **Authentication:** Web AP password is transport-layer protection. Sessions use an httpOnly cookie (hardware RNG, constant-time comparison, SameSite=Strict, no `Secure` flag because the device is HTTP-only).
+- **Raw frame injection bypass.** Overrides `ieee80211_raw_frame_sanity_check()` so ESP-IDF's WiFi driver accepts injected management frames instead of dropping them with "unsupport frame type 0c0/0a0". Linker flag `-Wl,-zmuldefs` lets our definition replace the library's.
+- **Country = "JP".** Set at boot with `WIFI_COUNTRY_POLICY_MANUAL` so channels 12–14 are TX-enabled. The default ("01" worldwide indoor) silently caps TX at ch 1–11.
+- **AP off during deauth.** During an active deauth attack the radio is switched to STA-only mode (`esp_wifi_set_mode(WIFI_MODE_STA)`) so the AP beacon scheduler does not pull the radio back to the dashboard channel. Restored afterwards.
+- **Promiscuous mode + MGMT filter.** Pauses AP beacon contest so raw injection actually goes out on the target's channel.
+- **Bluedroid + BT controller deinit/reinit** around Wi-Fi scans (BLE and Wi-Fi share the 2.4 GHz radio; scanning needs exclusive access).
+- **Cores:** Wi-Fi attacks, BLE scan, BLE spam, brute-force → Core 0. AsyncTCP web server → Core 1.
 
-## Known Limits
+## Limits
 
-- **2.4 GHz only.** ESP32-WROOM-32 has no 5 GHz radio. Any client connected on a router's 5 GHz band cannot be deauthed by this device — this is a hardware limit shared by every ESP32-based deauther (Marauder, SpaceHuhn, etc.). Use an ESP32-C5 dev board or a Linux + AWUS036ACH-class adapter for full-band coverage.
-- **PMF (802.11w).** Targets that use WPA3 or WPA2 with PMF "required" cryptographically protect management frames; deauth has no effect on those clients.
+- **2.4 GHz only.** ESP32-WROOM-32 has no 5 GHz radio. Clients connected on a router's 5 GHz band are physically unreachable from this device — this is a hardware limit shared by every ESP32-based wireless tool (Marauder, SpaceHuhn, etc.). Use ESP32-C5 or a Linux + dual-band USB adapter for full coverage.
+- **PMF (802.11w).** WPA3 and WPA2 with PMF "required" cryptographically protect management frames; deauth has no effect on those clients.
 
-## License
+## Author
 
-MIT — see `LICENSE` if present, otherwise treat as MIT.
+Built and maintained by **0x4161 (Ahmad Alanazi)**.
+
+- GitHub:    https://github.com/0x4161
+- LinkedIn:  https://www.linkedin.com/in/ahmad-alanazi-b1040933b
+- X:         https://x.com/0x4161
+- Instagram: https://instagram.com/fx_py3
+- YouTube:   https://youtube.com/@0x5952

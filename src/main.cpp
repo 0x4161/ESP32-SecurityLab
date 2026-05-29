@@ -154,6 +154,7 @@ enum Screen : uint8_t {
     SCR_BEACON,
     SCR_BEACON_COUNT,    // cycle through 5/10/20/50/100 fake APs
     SCR_PROBE,
+    SCR_BRUTE,           // brute-force progress screen
     SCR_BLE_SCAN,
     SCR_BLE_LIST,        // scrollable device list shown after BLE scan
     SCR_BLE_SPAM,
@@ -173,12 +174,13 @@ static const int MAIN_ITEMS_N = 3;
 static const char* WIFI_MENU_ITEMS[] = {
     "WiFi Scan",    // 0 — scan → build AP selection list
     "WiFi Death",   // 1 — deauth selected APs (or broadcast)
-    "Beacon Flood", // 2
-    "Beacon Count", // 3
-    "Probe Sniffer",// 4
-    "<< Back"       // 5
+    "WiFi Brute",   // 2 — brute-force PSK against selected AP
+    "Beacon Flood", // 3
+    "Beacon Count", // 4
+    "Probe Sniffer",// 5
+    "<< Back"       // 6
 };
-static const int WIFI_MENU_N = 6;
+static const int WIFI_MENU_N = 7;
 
 // ── BLE sub-menu ──────────────────────────────────────────────
 static const char* BLE_MENU_ITEMS[] = {
@@ -1510,6 +1512,45 @@ static void drawProbe() {
     oled.display();
 }
 
+// ── WiFi brute-force progress ────────────────────────────────
+static void drawBrute() {
+    oled.clearDisplay();
+    const char* status = g_brute.found  ? "FOUND" :
+                         g_brute.active ? "RUN"   : "STOP";
+    oledHeader("WiFi Brute", status);
+    oled.setTextColor(WHITE); oled.setTextSize(1);
+
+    char buf[24];
+    // SSID line — truncated to 18 chars
+    snprintf(buf, sizeof(buf), "SSID: %.16s", g_brute.ssid[0] ? g_brute.ssid : "(none)");
+    oled.setCursor(0, 14); oled.print(buf);
+
+    // Progress
+    snprintf(buf, sizeof(buf), "Try: %lu/%lu",
+             (unsigned long)g_brute.tried, (unsigned long)g_brute.total);
+    oled.setCursor(0, 26); oled.print(buf);
+
+    if (g_brute.found) {
+        // Match found — show password truncated to 18 chars
+        snprintf(buf, sizeof(buf), "PWD: %.18s", g_brute.foundPwd);
+        oled.setCursor(0, 38); oled.print(buf);
+        oledHint(">back  hold=back");
+    } else if (g_brute.active) {
+        // Currently trying — show current password truncated
+        snprintf(buf, sizeof(buf), "Now: %.18s",
+                 g_brute.curPwd[0] ? g_brute.curPwd : "...");
+        oled.setCursor(0, 38); oled.print(buf);
+        oledHint(">back  hold=stop");
+    } else {
+        // Not running (e.g. wordlist missing, or finished without match)
+        oled.setCursor(0, 38);
+        if (g_brute.total == 0) oled.print("Wordlist missing");
+        else                    oled.print("No match");
+        oledHint(">back  hold=start");
+    }
+    oled.display();
+}
+
 // ── BLE scanning splash ──────────────────────────────────────
 static void drawBLEScan() {
     oled.clearDisplay();
@@ -1655,6 +1696,7 @@ void refreshOLED() {
         case SCR_BEACON:       drawBeacon();      break;
         case SCR_BEACON_COUNT: drawBeaconCount(); break;
         case SCR_PROBE:        drawProbe();       break;
+        case SCR_BRUTE:        drawBrute();       break;
         case SCR_BLE_SCAN:     drawBLEScan();     break;
         case SCR_BLE_LIST:     drawBLEList();     break;
         case SCR_BLE_SPAM:     drawBLESpam();     break;
@@ -1733,6 +1775,7 @@ static void handleShortPress() {
     case SCR_DEAUTH:
     case SCR_BEACON:
     case SCR_PROBE:
+    case SCR_BRUTE:
         g_screen = SCR_WIFI_MENU;
         break;
 
@@ -1795,10 +1838,24 @@ static void handleLongPress() {
                     if (n == 0) logAdd("Death: no targets — hold=broadcast");
                 }
                 break;
-            case 2: g_screen = SCR_BEACON;       break;
-            case 3: g_screen = SCR_BEACON_COUNT; break;
-            case 4: g_screen = SCR_PROBE;        break;
-            case 5: g_screen = SCR_MAIN;         break;  // Back
+            case 2: {  // WiFi Brute — PSK brute against first selected AP
+                g_screen = SCR_BRUTE;
+                if (!g_brute.active) {
+                    int picked = -1;
+                    for (int i = 0; i < g_apCount; i++)
+                        if (g_aps[i].selected) { picked = i; break; }
+                    if (picked < 0) {
+                        logAdd("Brute: no target selected (use Scan → mark with *)", "WARN");
+                    } else {
+                        startBruteForce(g_aps[picked].ssid, "/wordlist.txt", 4000);
+                    }
+                }
+                break;
+            }
+            case 3: g_screen = SCR_BEACON;       break;
+            case 4: g_screen = SCR_BEACON_COUNT; break;
+            case 5: g_screen = SCR_PROBE;        break;
+            case 6: g_screen = SCR_MAIN;         break;  // Back
         }
         break;
 
@@ -1862,6 +1919,22 @@ static void handleLongPress() {
     case SCR_PROBE:
         if (g_probeActive) stopProbeSniffer();
         else startProbeSniffer();
+        break;
+
+    // ── WiFi Brute: long-press toggles start/stop ────────────
+    case SCR_BRUTE:
+        if (g_brute.active) {
+            stopBruteForce();
+        } else {
+            // Re-pick first selected AP from the list and restart
+            int picked = -1;
+            for (int i = 0; i < g_apCount; i++)
+                if (g_aps[i].selected) { picked = i; break; }
+            if (picked < 0)
+                logAdd("Brute: no target selected (use Scan → mark with *)", "WARN");
+            else
+                startBruteForce(g_aps[picked].ssid, "/wordlist.txt", 4000);
+        }
         break;
 
     // ── BLE spam: toggle ─────────────────────────────────────
@@ -1941,380 +2014,11 @@ static void serveHtml(AsyncWebServerRequest* req, const char* fsPath) {
 }
 
 void setupRoutes() {
-
-    // Static assets — long cache, no Set-Cookie
+    // REAPER web surface = landing page only.
+    // All operational control is on the OLED + BOOT button.
+    // No attack endpoints exposed over HTTP.
     server.serveStatic("/style.css",LittleFS,"/style.css").setCacheControl("max-age=604800, public");
-    server.serveStatic("/app.js",   LittleFS,"/app.js"   ).setCacheControl("max-age=604800, public");
-
-    // HTML pages — session cookie refreshed on each navigation
-    server.on("/",              HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/index.html");});
-    server.on("/index.html",    HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/index.html");});
-    server.on("/wifi.html",     HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/wifi.html");});
-    server.on("/ble.html",      HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/ble.html");});
-    server.on("/attack.html",   HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/attack.html");});
-    server.on("/advanced.html", HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/advanced.html");});
-    server.on("/lab.html",      HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/lab.html");});
-    server.on("/logs.html",     HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/logs.html");});
-    server.on("/settings.html", HTTP_GET,[](AsyncWebServerRequest* r){serveHtml(r,"/settings.html");});
-    server.serveStatic("/",LittleFS,"/").setDefaultFile("index.html");
-
-    // GET /api/status
-    server.on("/api/status",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(1024);
-        doc["uptime"]      = fmtUptime(millis());
-        doc["uptime_ms"]   = millis();
-        doc["free_heap"]   = ESP.getFreeHeap();
-        doc["total_heap"]  = ESP.getHeapSize();
-        doc["heap_pct"]    = (int)(100.f*(1.f-(float)ESP.getFreeHeap()/(float)ESP.getHeapSize()));
-        doc["chip"]        = ESP.getChipModel();
-        doc["revision"]    = ESP.getChipRevision();
-        doc["cpu_mhz"]     = ESP.getCpuFreqMHz();
-        doc["flash_mb"]    = (int)(ESP.getFlashChipSize()/1048576);
-        doc["sdk"]         = ESP.getSdkVersion();
-        doc["ap_ssid"]     = g_apSSID;
-        doc["ap_ip"]       = WiFi.softAPIP().toString();
-        doc["ap_clients"]  = (int)WiFi.softAPgetStationNum();
-        doc["log_count"]   = (int)g_logs.size();
-        doc["fs_total"]    = (int)LittleFS.totalBytes();
-        doc["fs_used"]     = (int)LittleFS.usedBytes();
-        doc["deauth_on"]   = g_deauth.active;
-        doc["deauth_sent"] = g_deauth.sent;
-        doc["beacon_on"]   = g_beacon.active;
-        doc["beacon_sent"] = g_beacon.sent;
-        doc["probe_on"]    = g_probeActive;
-        doc["probe_count"] = g_probeCount;
-        doc["ble_scan"]    = g_bleScanActive;
-        doc["ble_spam"]    = g_bleSpamActive;
-        String out; serializeJson(doc,out);
-        req->send(200,"application/json",out);
-    });
-
-    // WiFi scan
-    server.on("/api/wifi/scan",HTTP_POST,[](AsyncWebServerRequest* req){
-        if (g_scanRunning){req->send(200,"application/json","{\"status\":\"scanning\"}");return;}
-        if (g_probeActive)   stopProbeSniffer();
-        if (g_eapolActive)   stopEapolSniffer();
-        if (g_deauth.active) stopDeauth();
-        if (g_beacon.active) stopBeaconFlood();
-        g_scanRunning=true;
-        g_scanJson=R"({"networks":[],"count":0,"status":"scanning"})";
-        logAdd("Wi-Fi scan started");
-        xTaskCreatePinnedToCore(wifiScanTaskFn,"wifiscan",12288,nullptr,5,&g_wifiScanTask,0);
-        req->send(200,"application/json","{\"status\":\"scanning\"}");
-    });
-    server.on("/api/wifi/results",HTTP_GET,[](AsyncWebServerRequest* req){
-        req->send(200,"application/json",g_scanRunning
-            ?R"({"networks":[],"count":0,"status":"scanning"})":g_scanJson);
-    });
-
-    // Clients
-    server.on("/api/clients",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(2048);
-        doc["count"]=(int)WiFi.softAPgetStationNum();
-        JsonArray arr=doc.createNestedArray("clients");
-        wifi_sta_list_t wifiClients;
-        tcpip_adapter_sta_list_t adapterClients;
-        if (esp_wifi_ap_get_sta_list(&wifiClients)==ESP_OK &&
-            tcpip_adapter_get_sta_list(&wifiClients,&adapterClients)==ESP_OK) {
-            for (int i=0;i<adapterClients.num;i++) {
-                auto& s=adapterClients.sta[i];
-                JsonObject o=arr.createNestedObject();
-                char mac[18];
-                snprintf(mac,sizeof(mac),"%02X:%02X:%02X:%02X:%02X:%02X",
-                         s.mac[0],s.mac[1],s.mac[2],s.mac[3],s.mac[4],s.mac[5]);
-                o["mac"]=mac;
-                o["ip"]=ip4addr_ntoa((const ip4_addr_t*)&s.ip);
-            }
-        }
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-
-    // Logs
-    server.on("/api/logs",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(12288);
-        JsonArray arr=doc.createNestedArray("logs");
-        for (auto& e:g_logs){
-            JsonObject o=arr.createNestedObject();
-            o["ts"]=fmtUptime(e.ms);o["ms"]=(unsigned long)e.ms;
-            o["lvl"]=e.lvl;        o["msg"]=e.msg;
-        }
-        doc["count"]=(int)g_logs.size();
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-    server.on("/api/logs/clear",HTTP_POST,[](AsyncWebServerRequest* req){
-        g_logs.clear();logAdd("Logs cleared");
-        req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-
-    // Settings
-    auto* settingsH=new AsyncCallbackJsonWebHandler("/api/settings",
-        [](AsyncWebServerRequest* req,JsonVariant& json){
-            if(!json.is<JsonObject>()){req->send(400,"application/json","{\"error\":\"bad json\"}");return;}
-            auto obj=json.as<JsonObject>();bool changed=false;
-            if(obj.containsKey("ssid")){String s=obj["ssid"];s.trim();if(s.length()>=1&&s.length()<=32){g_apSSID=s;prefs.putString("ssid",g_apSSID);changed=true;}}
-            if(obj.containsKey("password")){String p=obj["password"];if(p.length()>=8&&p.length()<=63){g_apPass=p;prefs.putString("pass",g_apPass);changed=true;}}
-            req->send(changed?200:400,"application/json",
-                changed?"{\"status\":\"ok\",\"msg\":\"Saved. Reboot to apply.\"}":"{\"status\":\"err\",\"msg\":\"No change\"}");
-        },512);
-    server.addHandler(settingsH);
-
-    server.on("/api/reboot",HTTP_POST,[](AsyncWebServerRequest* req){
-        logAdd("Reboot triggered","WARN");
-        req->send(200,"application/json","{\"status\":\"ok\"}");
-        delay(500);ESP.restart();
-    });
-
-    // ── Deauth ────────────────────────────────────────────────
-    auto* deauthH=new AsyncCallbackJsonWebHandler("/api/attack/deauth/start",
-        [](AsyncWebServerRequest* req,JsonVariant& json){
-            if(!authOk(req)){sendUnauth(req);return;}
-            if(!json.is<JsonObject>()){req->send(400,"application/json","{\"error\":\"bad json\"}");return;}
-            auto obj=json.as<JsonObject>();
-            const char* bssid  =obj["bssid"]     |"00:00:00:00:00:00";
-            const char* target =obj["client_mac"] |"FF:FF:FF:FF:FF:FF";
-            uint8_t  ch  =obj["channel"]|6;
-            uint32_t cnt =obj["count"]  |0;
-            startDeauth(bssid,target,ch,cnt);
-            req->send(200,"application/json","{\"status\":\"ok\",\"msg\":\"Deauth started\"}");
-        },256);
-    server.addHandler(deauthH);
-    server.on("/api/attack/deauth/stop",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        stopDeauth();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/deauth/status",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(128);
-        doc["active"]=g_deauth.active;doc["sent"]=g_deauth.sent;doc["channel"]=g_deauth.channel;
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-
-    // ── Beacon ────────────────────────────────────────────────
-    auto* beaconH=new AsyncCallbackJsonWebHandler("/api/attack/beacon/start",
-        [](AsyncWebServerRequest* req,JsonVariant& json){
-            if(!authOk(req)){sendUnauth(req);return;}
-            if(!json.is<JsonObject>()){req->send(400,"application/json","{\"error\":\"bad json\"}");return;}
-            auto obj=json.as<JsonObject>();
-            uint8_t ch   =constrain((int)(obj["channel"]|6),1,14);
-            int     count=constrain((int)(obj["count"]  |0),0,500);
-            const char* ssid=obj["ssid"]|"";
-            startBeaconFlood(ch,count,ssid);
-            req->send(200,"application/json","{\"status\":\"ok\",\"msg\":\"Beacon flood started\"}");
-        },192);
-    server.addHandler(beaconH);
-    server.on("/api/attack/beacon/stop",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        stopBeaconFlood();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/beacon/status",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(128);
-        doc["active"]=g_beacon.active;doc["sent"]=g_beacon.sent;doc["channel"]=g_beacon.channel;
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-
-    // ── Probe sniffer ─────────────────────────────────────────
-    server.on("/api/attack/probe/start",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        if(g_scanRunning){req->send(409,"application/json","{\"error\":\"scan running\"}");return;}
-        startProbeSniffer();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/probe/stop",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        stopProbeSniffer();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/probe/data",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(8192);
-        doc["active"]=g_probeActive;doc["count"]=g_probeCount;
-        JsonArray arr=doc.createNestedArray("probes");
-        for(int i=0;i<g_probeCount;i++){
-            JsonObject o=arr.createNestedObject();
-            o["mac"]=g_probes[i].mac;o["ssid"]=g_probes[i].ssid;
-            o["rssi"]=g_probes[i].rssi;o["channel"]=0;o["ts"]=fmtUptime(g_probes[i].ts);
-        }
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-    server.on("/api/attack/probe/clear",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        g_probeCount=0;req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-
-    // ── WiFi Brute-Force ──────────────────────────────────────
-    auto* bruteH=new AsyncCallbackJsonWebHandler("/api/attack/brute/start",
-        [](AsyncWebServerRequest* req,JsonVariant& json){
-            if(!authOk(req)){sendUnauth(req);return;}
-            if(!json.is<JsonObject>()){req->send(400,"application/json","{\"error\":\"bad json\"}");return;}
-            auto obj=json.as<JsonObject>();
-            const char* ssid     = obj["ssid"]     | "";
-            const char* wordlist = obj["wordlist"] | "/wordlist.txt";
-            uint32_t    perPwdMs = obj["timeout"]  | 4000;
-            if (!ssid[0]) { req->send(400,"application/json","{\"error\":\"ssid required\"}"); return; }
-            bool ok = startBruteForce(ssid, wordlist, perPwdMs);
-            if (ok) req->send(200,"application/json","{\"status\":\"ok\",\"msg\":\"Brute started\"}");
-            else    req->send(400,"application/json","{\"error\":\"wordlist missing/empty\"}");
-        },256);
-    server.addHandler(bruteH);
-    server.on("/api/attack/brute/stop",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        stopBruteForce();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/brute/status",HTTP_GET,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        DynamicJsonDocument doc(256);
-        doc["active"] = g_brute.active;
-        doc["ssid"]   = g_brute.ssid;
-        doc["tried"]  = g_brute.tried;
-        doc["total"]  = g_brute.total;
-        doc["current"]= g_brute.curPwd;
-        doc["found"]  = g_brute.found;
-        doc["password"] = g_brute.found ? g_brute.foundPwd : "";
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-    // Upload a custom wordlist (multipart). Saves to LittleFS as /wordlist_custom.txt
-    // Auth is checked on EVERY chunk because AsyncWebServer fires the upload handler
-    // before the response handler — a missing check would allow unauth file writes.
-    // Size hard-capped at 256 KB to prevent LittleFS exhaustion (DoS).
-    server.on("/api/attack/brute/wordlist", HTTP_POST,
-        [](AsyncWebServerRequest* req){
-            if(!authOk(req)){sendUnauth(req);return;}
-            req->send(200, "application/json", "{\"status\":\"ok\"}");
-        },
-        [](AsyncWebServerRequest* req, String filename, size_t index, uint8_t* data, size_t len, bool final){
-            static File f;
-            static size_t totalWritten = 0;
-            static bool   aborted      = false;
-            const size_t  MAX_WORDLIST_BYTES = 256 * 1024;  // 256 KB cap
-
-            if (index == 0) {
-                aborted      = false;
-                totalWritten = 0;
-                if (!authOk(req)) { aborted = true; return; }
-                if (LittleFS.exists("/wordlist_custom.txt")) LittleFS.remove("/wordlist_custom.txt");
-                f = LittleFS.open("/wordlist_custom.txt", "w");
-            }
-            if (aborted || !f) return;
-            if (totalWritten + len > MAX_WORDLIST_BYTES) {
-                aborted = true;
-                f.close();
-                LittleFS.remove("/wordlist_custom.txt");
-                logAdd("Custom wordlist rejected — size > 256KB", "WARN");
-                return;
-            }
-            if (len) { f.write(data, len); totalWritten += len; }
-            if (final) {
-                f.close();
-                logAdd("Custom wordlist uploaded ("+String(totalWritten)+" bytes)");
-            }
-        }
-    );
-    server.on("/api/attack/brute/wordlists", HTTP_GET,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        DynamicJsonDocument doc(512);
-        JsonArray arr = doc.createNestedArray("lists");
-        if (LittleFS.exists("/wordlist.txt")) {
-            JsonObject o = arr.createNestedObject();
-            o["path"] = "/wordlist.txt"; o["name"] = "default";
-            o["lines"] = countWordlistLines("/wordlist.txt");
-        }
-        if (LittleFS.exists("/wordlist_custom.txt")) {
-            JsonObject o = arr.createNestedObject();
-            o["path"] = "/wordlist_custom.txt"; o["name"] = "custom";
-            o["lines"] = countWordlistLines("/wordlist_custom.txt");
-        }
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-
-    // ── BLE scan ──────────────────────────────────────────────
-    auto* bleScanH=new AsyncCallbackJsonWebHandler("/api/ble/scan",
-        [](AsyncWebServerRequest* req,JsonVariant& json){
-            if(!authOk(req)){sendUnauth(req);return;}
-            if(!g_bleReady){req->send(503,"application/json","{\"error\":\"BLE unavailable — WiFi scan in progress\"}");return;}
-            int secs=5;
-            if(json.is<JsonObject>()) secs=json["duration"]|(json["seconds"]|5);
-            secs=constrain(secs,2,20);
-            if(g_bleScanActive){req->send(200,"application/json","{\"status\":\"scanning\"}");return;}
-            req->send(200,"application/json","{\"status\":\"ok\",\"msg\":\"BLE scan started\"}");
-            xTaskCreatePinnedToCore([](void* p){
-                startBLEScan(*(int*)p);delete(int*)p;vTaskDelete(nullptr);
-            },"blescan",4096,new int(secs),3,nullptr,0);
-        },64);
-    server.addHandler(bleScanH);
-    server.on("/api/ble/results",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(8192);
-        doc["scanning"]=g_bleScanActive;doc["count"]=(int)g_bleResults.size();
-        JsonArray arr=doc.createNestedArray("devices");
-        for(auto& d:g_bleResults){
-            JsonObject o=arr.createNestedObject();
-            o["mac"]=d.addr;o["name"]=d.name;o["rssi"]=d.rssi;o["type"]=d.type;
-        }
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-
-    // ── BLE spam ──────────────────────────────────────────────
-    auto* bleSpamH=new AsyncCallbackJsonWebHandler("/api/ble/spam",
-        [](AsyncWebServerRequest* req,JsonVariant& json){
-            if(json.is<JsonObject>()){
-                auto obj=json.as<JsonObject>();
-                g_bleSpamPlatforms.apple  =obj["apple"]  |true;
-                g_bleSpamPlatforms.android=obj["android"]|true;
-                g_bleSpamPlatforms.windows=obj["windows"]|true;
-            } else g_bleSpamPlatforms.apple=g_bleSpamPlatforms.android=g_bleSpamPlatforms.windows=true;
-            startBLESpam("multi");
-            req->send(200,"application/json","{\"status\":\"ok\",\"msg\":\"BLE spam started\"}");
-        },128);
-    server.addHandler(bleSpamH);
-    server.on("/api/ble/spam/stop",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        stopBLESpam();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-
-    // ── Evil twin ─────────────────────────────────────────────
-    auto* evilTwinH=new AsyncCallbackJsonWebHandler("/api/attack/evil_twin/start",
-        [](AsyncWebServerRequest* req,JsonVariant& json){
-            if(!authOk(req)){sendUnauth(req);return;}
-            if(!json.is<JsonObject>()){req->send(400,"application/json","{\"error\":\"bad json\"}");return;}
-            auto obj=json.as<JsonObject>();
-            String ssid=obj["ssid"]|"";ssid.trim();
-            if(ssid.length()==0||ssid.length()>32){req->send(400,"application/json","{\"error\":\"ssid required (1-32 chars)\"}");return;}
-            for(int i=0;i<(int)ssid.length();i++) if((uint8_t)ssid[i]<0x20||(uint8_t)ssid[i]>0x7E){req->send(400,"application/json","{\"error\":\"ssid contains invalid chars\"}");return;}
-            uint8_t ch=constrain((int)(obj["channel"]|6),1,14);
-            startEvilTwin(ssid,ch);
-            req->send(200,"application/json","{\"status\":\"ok\",\"msg\":\"Evil Twin started\"}");
-        },192);
-    server.addHandler(evilTwinH);
-    server.on("/api/attack/evil_twin/stop",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        stopEvilTwin();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/evil_twin/status",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(192);
-        doc["active"]=g_evilTwin.active;doc["ssid"]=g_evilTwin.targetSSID;doc["channel"]=g_evilTwin.channel;
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-
-    // ── EAPOL sniffer ─────────────────────────────────────────
-    server.on("/api/attack/eapol/start",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        if(g_scanRunning){req->send(409,"application/json","{\"error\":\"scan running\"}");return;}
-        startEapolSniffer();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/eapol/stop",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        stopEapolSniffer();req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
-    server.on("/api/attack/eapol/data",HTTP_GET,[](AsyncWebServerRequest* req){
-        DynamicJsonDocument doc(4096);
-        doc["active"]=g_eapolActive;doc["count"]=g_eapolCount;
-        JsonArray arr=doc.createNestedArray("frames");
-        for(int i=0;i<g_eapolCount;i++){
-            JsonObject o=arr.createNestedObject();
-            o["bssid"]=g_eapolFrames[i].bssid;o["client"]=g_eapolFrames[i].client;
-            o["ts"]=fmtUptime(g_eapolFrames[i].ts);
-        }
-        String out;serializeJson(doc,out);req->send(200,"application/json",out);
-    });
-    server.on("/api/attack/eapol/clear",HTTP_POST,[](AsyncWebServerRequest* req){
-        if(!authOk(req)){sendUnauth(req);return;}
-        g_eapolCount=0;req->send(200,"application/json","{\"status\":\"ok\"}");
-    });
+    server.serveStatic("/",         LittleFS,"/"        ).setDefaultFile("index.html");
 
     server.onNotFound([](AsyncWebServerRequest* req){
         req->send(404,"application/json","{\"error\":\"Not Found\"}");

@@ -1,227 +1,148 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ESP32 Security Lab</title>
-<link rel="stylesheet" href="style.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<meta name="robots" content="noindex">
+<title>REAPER &mdash; Wireless Offensive Toolkit</title>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
-<nav class="nav">
-  <div class="nav-brand">ESP32 <span>// SecurityLab</span></div>
-  <a href="index.html">Home</a>
-  <a href="wifi.html">Wi-Fi Recon</a>
-  <a href="attack.html">Attack</a>
-  <a href="ble.html">BLE</a>
-  <a href="advanced.html">Advanced</a>
-  <a href="lab.html">Lab Sim</a>
-  <a href="logs.html">Logs</a>
-  <a href="settings.html">Settings</a>
-</nav>
+<div class="rp-stars"></div>
 
-<div class="container">
+<main class="rp-main">
 
-  <div class="page-header">
-    <h1><span class="accent">&gt;</span> Dashboard</h1>
-    <p>System overview — auto-refresh every 5 s</p>
-  </div>
+  <!-- HERO -->
+  <section class="rp-hero">
+    <div class="rp-skull">&#9763;</div>
 
-  <!-- ── Stat row ── -->
-  <div class="grid-4 mb2" id="stat-row">
-    <div class="stat-card">
-      <div class="stat-label">Uptime</div>
-      <div class="stat-value" id="s-uptime" style="font-size:1.1rem">--</div>
+    <h1 class="rp-title">REAPER</h1>
+    <p class="rp-sub">Wireless Offensive Toolkit &middot; ESP32 &middot; OLED-driven</p>
+
+    <div class="rp-badges">
+      <span class="rp-badge rp-badge--red">2.4 GHz</span>
+      <span class="rp-badge rp-badge--blue">BLE 4.2</span>
+      <span class="rp-badge rp-badge--gray">802.11 b/g/n</span>
     </div>
-    <div class="stat-card">
-      <div class="stat-label">Heap Free</div>
-      <div class="stat-value" id="s-heap">--</div>
-      <div class="stat-label" id="s-heap-pct" style="margin-top:2px"></div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">AP Clients</div>
-      <div class="stat-value text-b" id="s-clients">--</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">AP IP</div>
-      <div class="stat-value text-g" id="s-ip" style="font-size:1.1rem">--</div>
-    </div>
-  </div>
+  </section>
 
-  <div class="grid-2">
+  <!-- ABOUT -->
+  <section class="rp-card">
+    <h2 class="rp-h2"># What is REAPER?</h2>
+    <p>
+      A pocket-sized wireless attack platform that runs entirely on an
+      <strong>ESP32-WROOM-32</strong>, controlled by a single button and
+      a 0.96&Prime; OLED. No phone, no laptop, no app &mdash; every operation
+      is driven from the device itself.
+    </p>
+    <p>
+      Built around raw 802.11 frame injection and bare ESP-IDF radio control,
+      it harvests Wi-Fi handshakes, kicks clients off APs, floods the spectrum
+      with phantom beacons, and brute-forces PSKs from a built-in wordlist.
+    </p>
+  </section>
 
-    <!-- Device info table -->
-    <div class="card">
-      <div class="card-title">Device Info</div>
-      <div id="dev-info">
-        <div class="info-row"><span class="text-dim">Chip</span>    <span id="d-chip">--</span></div>
-        <div class="info-row"><span class="text-dim">CPU</span>     <span id="d-cpu">--</span></div>
-        <div class="info-row"><span class="text-dim">Flash</span>   <span id="d-flash">--</span></div>
-        <div class="info-row"><span class="text-dim">Heap Total</span><span id="d-heap-tot">--</span></div>
-        <div class="info-row"><span class="text-dim">SDK</span>     <span id="d-sdk" class="text-dim" style="font-size:.78rem">--</span></div>
-        <div class="info-row"><span class="text-dim">AP SSID</span> <span id="d-ssid" class="text-g">--</span></div>
+  <!-- ARSENAL -->
+  <section class="rp-card">
+    <h2 class="rp-h2"># Arsenal</h2>
+    <div class="rp-grid">
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#128225;</span>
+        <h3>Deauth / Disassoc</h3>
+        <p>Raw 802.11 frame injection on the target&rsquo;s channel. Single or multi-AP rotation.</p>
+      </div>
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#127760;</span>
+        <h3>Beacon Flood</h3>
+        <p>Sprays the spectrum with thousands of phantom SSIDs. Sequentially numbered.</p>
+      </div>
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#128273;</span>
+        <h3>PSK Brute-Force</h3>
+        <p>5000-password built-in wordlist. Iterates against any visible WPA/WPA2 SSID.</p>
+      </div>
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#128123;</span>
+        <h3>Evil Twin</h3>
+        <p>Clones a target SSID as an open AP on the same channel.</p>
+      </div>
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#128246;</span>
+        <h3>Probe Sniffer</h3>
+        <p>Captures probe requests revealing every network nearby devices remember.</p>
+      </div>
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#129309;</span>
+        <h3>EAPOL Sniffer</h3>
+        <p>Captures the WPA 4-way handshake for offline cracking with hashcat.</p>
+      </div>
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#128309;</span>
+        <h3>BLE Spam</h3>
+        <p>Apple proximity / Microsoft Swift Pair / Samsung Easy Setup payloads.</p>
+      </div>
+      <div class="rp-mod">
+        <span class="rp-mod__ico">&#128752;</span>
+        <h3>Wi-Fi / BLE Scan</h3>
+        <p>Full 2.4 GHz enumeration plus BLE advertising discovery.</p>
       </div>
     </div>
+  </section>
 
-    <!-- Health bars -->
-    <div class="card">
-      <div class="card-title">System Health</div>
+  <!-- CONTROL -->
+  <section class="rp-card">
+    <h2 class="rp-h2"># Control surface</h2>
+    <p>
+      A single <strong>BOOT</strong> button (GPIO0) drives the entire menu.
+      All operations are visible on the OLED in real time.
+    </p>
+    <table class="rp-tab">
+      <tr><th>Action</th><th>Meaning</th></tr>
+      <tr><td><kbd>Short press</kbd></td><td>Move cursor / cycle selector</td></tr>
+      <tr><td><kbd>Long press</kbd></td><td>Enter / start / commit</td></tr>
+    </table>
+  </section>
 
-      <div class="mb2">
-        <div style="display:flex;justify-content:space-between;font-size:.78rem;margin-bottom:5px">
-          <span class="text-dim">Heap Usage</span>
-          <span id="h-heap-pct">--</span>
-        </div>
-        <div class="progress"><div class="progress-bar" id="h-heap-bar" style="width:0"></div></div>
-      </div>
+  <!-- SOCIAL -->
+  <section class="rp-card">
+    <h2 class="rp-h2"># Author</h2>
+    <p>Built &amp; maintained by <strong>0x4161 (Ahmad Alanazi)</strong>.</p>
 
-      <div class="mb2">
-        <div style="display:flex;justify-content:space-between;font-size:.78rem;margin-bottom:5px">
-          <span class="text-dim">Filesystem Used</span>
-          <span id="h-fs-val" class="text-b">--</span>
-        </div>
-        <div class="progress">
-          <div class="progress-bar" id="h-fs-bar"
-               style="width:0;background:linear-gradient(90deg,var(--blue),var(--green))"></div>
-        </div>
-      </div>
-
-      <div style="border-top:1px solid var(--border);padding-top:12px;font-size:.82rem">
-        <div class="info-row">
-          <span class="text-dim">Log entries</span>
-          <span id="h-logs" class="text-b">--</span>
-        </div>
-        <div class="info-row">
-          <span class="text-dim">Scan status</span>
-          <span id="h-scan" class="text-dim">Idle</span>
-        </div>
-      </div>
+    <div class="rp-social">
+      <a class="rp-soc" href="https://github.com/0x4161" target="_blank" rel="noopener">
+        <span class="rp-soc__ico">&lt;/&gt;</span><span>GitHub &middot; 0x4161</span>
+      </a>
+      <a class="rp-soc" href="https://www.linkedin.com/in/ahmad-alanazi-b1040933b" target="_blank" rel="noopener">
+        <span class="rp-soc__ico">in</span><span>LinkedIn &middot; Ahmad Alanazi</span>
+      </a>
+      <a class="rp-soc" href="https://x.com/0x4161" target="_blank" rel="noopener">
+        <span class="rp-soc__ico">&#120143;</span><span>X &middot; @0x4161</span>
+      </a>
+      <a class="rp-soc" href="https://instagram.com/fx_py3" target="_blank" rel="noopener">
+        <span class="rp-soc__ico">&#9673;</span><span>Instagram &middot; @fx_py3</span>
+      </a>
+      <a class="rp-soc" href="https://youtube.com/@0x5952" target="_blank" rel="noopener">
+        <span class="rp-soc__ico">&#9654;</span><span>YouTube &middot; @0x5952</span>
+      </a>
     </div>
+  </section>
 
-  </div>
+  <!-- DISCLAIMER -->
+  <section class="rp-card rp-warn">
+    <h2 class="rp-h2">&#9888; Lawful use only</h2>
+    <p>
+      REAPER is built for authorized security research, hardware education,
+      and CTF/lab use. Using it against any network or device you do not
+      own or have written permission to test is illegal and not endorsed.
+    </p>
+  </section>
 
-  <!-- Connected Clients -->
-  <div class="card">
-    <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
-      <span>&#x1F4F1; Connected Clients</span>
-      <span class="badge badge-blue" id="clients-count">0</span>
-    </div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>#</th><th>MAC Address</th><th>IP Address</th></tr></thead>
-        <tbody id="clients-table">
-          <tr><td colspan="3" style="text-align:center;color:var(--text-dim);padding:16px">No clients connected</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
+  <footer class="rp-foot">
+    <span>REAPER v3.0 &middot; ESP32-WROOM-32 &middot; OLED-driven</span>
+  </footer>
 
-  <!-- Quick access -->
-  <div class="card mb0">
-    <div class="card-title">Quick Access</div>
-    <div class="btn-group mb0">
-      <a href="wifi.html"     class="btn btn-primary">&#x25B6; Wi-Fi Scan</a>
-      <a href="lab.html"      class="btn btn-blue">&#x1F9EA; Lab Simulation</a>
-      <a href="logs.html"     class="btn btn-ghost">&#x1F4CB; View Logs</a>
-      <a href="settings.html" class="btn btn-ghost">&#x2699; Settings</a>
-    </div>
-  </div>
+</main>
 
-  <!-- Offline / Demo banner (shown when ESP32 not reachable) -->
-  <div id="offline-banner" style="display:none;margin-top:12px">
-    <div class="alert alert-warn" style="justify-content:center;text-align:center">
-      <span>&#x26A0;</span>
-      <span><strong>DEMO MODE</strong> — ESP32 not reachable. Showing sample data.
-      Flash firmware and connect to AP to see live values.</span>
-    </div>
-  </div>
-
-  <div style="text-align:center;color:var(--text-dim);font-size:.72rem;margin-top:16px">
-    <span class="dot dot-g dot-pulse"></span>
-    Auto-refresh: 5 s &nbsp;|&nbsp; ESP32 Security Lab v1.0 &nbsp;|&nbsp; Educational Use Only
-  </div>
-
-</div><!-- /container -->
-
-<script src="app.js"></script>
-<script>
-// Demo data shown when ESP32 is not reachable (preview / offline)
-var DEMO = {
-  uptime: '00h 12m 34s', free_heap: 218432, total_heap: 327680,
-  heap_pct: 33, chip: 'ESP32-D0WD-V3', revision: 3, cpu_mhz: 240,
-  flash_mb: 4, sdk: 'v4.4.7', ap_ssid: 'ESP32-SecurityLab',
-  ap_ip: '192.168.4.1', ap_clients: 1, log_count: 3,
-  fs_total: 1441792, fs_used: 61440
-};
-
-async function loadStatus() {
-  var r = await api('/api/status');
-  var d = r.ok ? r.data : DEMO;
-  var isDemo = !r.ok;
-
-  document.getElementById('offline-banner').style.display = isDemo ? 'block' : 'none';
-
-  // Stat row
-  document.getElementById('s-uptime').textContent  = d.uptime   || '--';
-  document.getElementById('s-heap').textContent     = fmtBytes(d.free_heap);
-  document.getElementById('s-heap-pct').textContent = d.heap_pct + '% used';
-  document.getElementById('s-clients').textContent  = d.ap_clients;
-  document.getElementById('s-ip').textContent       = d.ap_ip;
-
-  // Device info
-  document.getElementById('d-chip').textContent     = (d.chip || '--') + ' rev' + d.revision;
-  document.getElementById('d-cpu').textContent      = d.cpu_mhz + ' MHz';
-  document.getElementById('d-flash').textContent    = d.flash_mb + ' MB';
-  document.getElementById('d-heap-tot').textContent = fmtBytes(d.total_heap);
-  document.getElementById('d-sdk').textContent      = d.sdk   || '--';
-  document.getElementById('d-ssid').textContent     = d.ap_ssid;
-
-  // Health — heap
-  var hp  = d.heap_pct || 0;
-  var hEl = document.getElementById('h-heap-pct');
-  var hBar= document.getElementById('h-heap-bar');
-  hEl.textContent  = hp + '%';
-  hEl.style.color  = pctColor(hp);
-  hBar.style.width = hp + '%';
-  hBar.className   = 'progress-bar' + (hp >= 80 ? ' danger' : hp >= 60 ? ' warn' : '');
-
-  // Health — filesystem
-  var fsUsed  = d.fs_used  || 0;
-  var fsTotal = d.fs_total || 1;
-  var fsPct   = Math.round(100 * fsUsed / fsTotal);
-  document.getElementById('h-fs-val').textContent = fmtBytes(fsUsed) + ' / ' + fmtBytes(fsTotal);
-  document.getElementById('h-fs-bar').style.width = fsPct + '%';
-
-  // Misc
-  document.getElementById('h-logs').textContent = d.log_count;
-}
-
-async function loadClients() {
-  var r = await api('/api/clients');
-  if (!r.ok) return;
-  var clients = r.data.clients || [];
-  document.getElementById('clients-count').textContent = clients.length;
-  var tbody = document.getElementById('clients-table');
-  tbody.textContent = '';
-  if (!clients.length) {
-    var tr = document.createElement('tr');
-    var td = document.createElement('td');
-    td.colSpan = 3; td.textContent = 'No clients connected';
-    td.style.cssText = 'text-align:center;color:var(--text-dim);padding:16px';
-    tr.appendChild(td); tbody.appendChild(tr); return;
-  }
-  clients.forEach(function(c, i) {
-    var tr = document.createElement('tr');
-    var td0 = document.createElement('td'); td0.className = 'text-dim'; td0.textContent = i + 1;
-    var td1 = document.createElement('td'); td1.style.fontFamily = 'monospace'; td1.textContent = c.mac;
-    var td2 = document.createElement('td'); td2.style.color = 'var(--green)'; td2.textContent = c.ip;
-    tr.append(td0, td1, td2); tbody.appendChild(tr);
-  });
-}
-
-function tick() { loadStatus(); loadClients(); }
-tick();
-setInterval(tick, 5000);
-</script>
 </body>
 </html>
